@@ -20,7 +20,7 @@ def on_stop_camera():
 
 
 # Create a NiceGUI page
-@ui.page('/')
+@ui.page('/record')
 def main_page():
     ui.page_title("Raspberry Pi Surveillance")
     start_button = ui.button("Start Camera")
@@ -49,9 +49,3 @@ def main_page():
 
     start_button.on_click(start_timer)
     stop_button.on_click(stop_timer)
-
-# Start the NiceGUI app
-ui.run(host='0.0.0.0', port=8080)
-
-
-

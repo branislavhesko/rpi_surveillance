@@ -6,7 +6,7 @@ from fastapi.responses import RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from nicegui import app, ui
 
-from rpi_surveillance.ui.record import main_page
+from rpi_surveillance.ui.record import drawer, main_page, Record
 
 # Dummy passwords – in a real app, use proper hashing
 passwords = {'user1': 'pass1', 'user2': 'pass2'}
@@ -36,13 +36,17 @@ def main_menu():
     def logout() -> None:
         app.storage.user.clear()
         ui.navigate.to('/login')  # Redirect to the login page
-
-    with ui.tabs() as tabs:
-        ui.tab('Home')
-        ui.tab('Record')
-        ui.tab('Analyze')
-        ui.tab('Storage')
         
+    record = Record()
+    d = drawer(record)
+    with ui.header().classes(replace='row items-center') as header:
+        ui.button(on_click=lambda: d.toggle(), icon='menu').props('flat color=white')
+        with ui.tabs() as tabs:
+            ui.tab('Home')
+            ui.tab('Record')
+            ui.tab('Analyze')
+            ui.tab('Storage')
+
     with ui.tab_panels(tabs, value='Home').classes('w-full'):
         with ui.tab_panel('Home'):
             with ui.column().classes('w-full items-center'):
@@ -50,7 +54,7 @@ def main_menu():
                 ui.image('rpi_surveillance/assets/logo.png').style('width: 640px; height: 640px')
         with ui.tab_panel('Record'):
             with ui.column().classes('w-full items-center'):
-                main_page()
+                main_page(record)
         with ui.tab_panel('Analyze'):
             with ui.column().classes('w-full items-center'):
                 analyze_page()
@@ -97,5 +101,6 @@ def login_page() -> Optional[RedirectResponse]:
         ui.button('Log in', on_click=try_login)
     return None
 
+
 if __name__ in {'__main__', '__mp_main__'}:
-    ui.run(storage_secret='SECRET', port=8080, host='0.0.0.0')
+    ui.run(storage_secret='FAIRYTALE', port=9000, host='0.0.0.0')

@@ -7,11 +7,12 @@ logging.basicConfig(
 )
 
 from fastapi import FastAPI
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from picamera2 import Picamera2
 import numpy as np
 import cv2
+import asyncio
 
 
 class Settings(BaseModel):
@@ -56,6 +57,7 @@ class PiCameraHandler:
 
 app = FastAPI()
 _camera_handler = None
+_streaming_active = False
 
 
 @app.get("/")
@@ -102,6 +104,50 @@ def restart_camera():
 def update_settings(settings: Settings):
     _camera_handler.update_settings(settings)
     return {"message": "Settings updated"}
+
+
+@app.get("/stream")
+async def stream_video():
+    """Stream live video as MJPEG"""
+    global _streaming_active
+
+    if _camera_handler is None:
+        return JSONResponse(status_code=400, content={"message": "Camera not started"})
+
+    _streaming_active = True
+
+    async def generate_frames():
+        while _streaming_active:
+            try:
+                # Capture frame from camera
+                frame = _camera_handler.capture_image()
+
+                # Encode frame as JPEG
+                _, buffer = cv2.imencode('.jpg', frame)
+                frame_bytes = buffer.tobytes()
+
+                # Yield frame in multipart format
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+                # Small delay to control frame rate
+                await asyncio.sleep(0.033)  # ~30 fps
+            except Exception as e:
+                logging.error(f"Error generating frame: {e}")
+                break
+
+    return StreamingResponse(
+        generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.get("/stream/stop")
+def stop_stream():
+    """Stop the video stream"""
+    global _streaming_active
+    _streaming_active = False
+    return {"message": "Stream stopped"}
 
 
 def run_server():

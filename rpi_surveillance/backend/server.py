@@ -13,6 +13,18 @@ from picamera2 import Picamera2
 import numpy as np
 import cv2
 import asyncio
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+RECORDINGS_DIR = Path("/home/raspberry/recordings")
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _transform_image(image: np.ndarray) -> np.ndarray:
+    return np.flip(image, axis=0)
 
 
 class Settings(BaseModel):
@@ -29,8 +41,14 @@ class PiCameraHandler:
         self.logger = logging.getLogger(__name__)
         self.logger.info("Initializing camera")
         self.picam2 = Picamera2()
-        self.picam2.configure(self.picam2.create_preview_configuration(Settings().to_dict()))
+        self._settings = Settings()
+        self.picam2.configure(self.picam2.create_preview_configuration(self._settings.to_dict()))
         self.streaming_active = False
+        self._recording = False
+        self._recording_proc: subprocess.Popen | None = None
+        self._recording_thread: threading.Thread | None = None
+        self._recording_path: str | None = None
+        self._capture_lock = threading.Lock()
 
     def start(self):
         self.logger.info("Starting camera")
@@ -48,6 +66,7 @@ class PiCameraHandler:
     def close(self):
         """Properly close and release camera resources"""
         self.logger.info("Closing camera and releasing resources")
+        self.stop_recording()
         try:
             self.picam2.stop()
         except Exception as e:
@@ -59,10 +78,76 @@ class PiCameraHandler:
         return self
     
     def capture_image(self):
-        np_array = self.picam2.capture_array()
-        np_array = np.ascontiguousarray(np_array[::-1, :, :])
+        with self._capture_lock:
+            np_array = self.picam2.capture_array()
+            np_array = np.ascontiguousarray(np_array[::-1, :, :])
         self.logger.info(f"Captured image of size {np_array.shape}")
         return np_array
+
+    def save_image(self) -> str:
+        """Capture and save a single frame as JPEG."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = str(RECORDINGS_DIR / f"capture_{timestamp}.jpg")
+        frame = self.capture_image()
+        cv2.imwrite(filename, frame)
+        self.logger.info(f"Saved image to {filename}")
+        return filename
+
+    def start_recording(self) -> str:
+        """Start recording video to an MP4 file (H.264 via ffmpeg)."""
+        if self._recording:
+            return self._recording_path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._recording_path = str(RECORDINGS_DIR / f"video_{timestamp}.mp4")
+        frame = self.capture_image()
+        h, w = frame.shape[:2]
+        self._recording_proc = subprocess.Popen(
+            ['ffmpeg', '-y',
+             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+             '-s', f'{w}x{h}', '-r', '15',
+             '-i', '-',
+             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+             '-pix_fmt', 'yuv420p',
+             self._recording_path],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._recording = True
+        self._recording_thread = threading.Thread(target=self._record_loop, daemon=True)
+        self._recording_thread.start()
+        self.logger.info(f"Started recording to {self._recording_path}")
+        return self._recording_path
+
+    def _record_loop(self):
+        """Background thread: capture frames and pipe to ffmpeg."""
+        while self._recording:
+            try:
+                frame = self.capture_image()
+                self._recording_proc.stdin.write(frame.tobytes())
+            except Exception as e:
+                self.logger.error(f"Error recording frame: {e}")
+                break
+            time.sleep(1 / 15)
+
+    def stop_recording(self) -> str | None:
+        """Stop recording and finalise the video file."""
+        if not self._recording:
+            return None
+        self._recording = False
+        if self._recording_thread:
+            self._recording_thread.join(timeout=5)
+            self._recording_thread = None
+        if self._recording_proc:
+            try:
+                self._recording_proc.stdin.close()
+                self._recording_proc.wait(timeout=30)
+            except Exception as e:
+                self.logger.error(f"Error finalizing recording: {e}")
+                self._recording_proc.kill()
+            self._recording_proc = None
+        path = self._recording_path
+        self._recording_path = None
+        self.logger.info(f"Stopped recording, saved to {path}")
+        return path
 
     def restart_camera(self):
         """Restart the camera by stopping and starting it"""
@@ -116,18 +201,13 @@ def start_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
 
 
 def _start_camera_internal(_camera_handler: None | PiCameraHandler):
-    # Clean up existing handler if it exists
     if _camera_handler is not None:
         logging.info("Cleaning up existing camera handler")
         try:
             _camera_handler.close()
         except Exception as e:
             logging.error(f"Error closing existing camera: {e}")
-        _camera_handler.reset_camera()
-
-    else:
-        # Create and start new camera handler
-        _camera_handler = PiCameraHandler()
+    _camera_handler = PiCameraHandler()
     _camera_handler.start()
     camera_injector.set_camera_handler(_camera_handler)
     return _camera_handler
@@ -221,6 +301,47 @@ def stop_stream(camera_handler: PiCameraHandler = Depends(camera_injector)):
     if camera_handler:
         camera_handler.streaming_active = False
     return {"message": "Stream stopped"}
+
+
+@app.get("/save")
+def save_image(camera_handler: PiCameraHandler = Depends(camera_injector)):
+    """Capture and save the current frame as a JPEG file."""
+    if camera_handler is None:
+        return JSONResponse(status_code=400, content={"message": "Camera not started"})
+    try:
+        filename = camera_handler.save_image()
+        return {"message": "Image saved", "filename": filename}
+    except Exception as e:
+        logging.error(f"Error saving image: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+
+@app.get("/record/start")
+def start_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
+    """Start recording video to an MP4 file."""
+    if camera_handler is None:
+        return JSONResponse(status_code=400, content={"message": "Camera not started"})
+    try:
+        filename = camera_handler.start_recording()
+        return {"message": "Recording started", "filename": filename}
+    except Exception as e:
+        logging.error(f"Error starting recording: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+
+@app.get("/record/stop")
+def stop_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
+    """Stop recording and finalise the video file."""
+    if camera_handler is None:
+        return JSONResponse(status_code=400, content={"message": "Camera not started"})
+    try:
+        filename = camera_handler.stop_recording()
+        if filename:
+            return {"message": "Recording saved", "filename": filename}
+        return {"message": "Not recording"}
+    except Exception as e:
+        logging.error(f"Error stopping recording: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 
 def run_server():

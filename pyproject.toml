@@ -1,0 +1,26 @@
+[project]
+name = "rpi-surveillance"
+version = "0.1.0"
+description = "AI-powered surveillance system for Raspberry Pi"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "nicegui",
+    "numpy",
+    "opencv-python-headless",
+    # Add your other dependencies here
+]
+
+[tool.ruff]
+# Modern replacement for Black and Isort
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"] # Enable Pyflakes, pycodestyle, isort, and pyupgrade
+
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+testpaths = ["tests"]

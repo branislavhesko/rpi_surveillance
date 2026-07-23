@@ -13,6 +13,11 @@ PASSWORDS = {'user1': 'pass1', 'user2': 'pass2', 'admin': 'admin'}
 
 UNRESTRICTED_PAGE_ROUTES = {'/login'}
 
+# Path prefixes that bypass authentication entirely. The camera REST API
+# (mounted under /api) is called server-side without a browser session cookie,
+# so it must not be redirected to the login page.
+UNRESTRICTED_PATH_PREFIXES = ('/_nicegui', '/api', '/media')
+
 LOGIN_CSS = """
 html, body {
     background: radial-gradient(ellipse at 50% 0%, #1a2a50 0%, #090c18 65%) fixed !important;
@@ -52,11 +57,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login."""
 
     async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if (path.startswith(UNRESTRICTED_PATH_PREFIXES)
+                or path in UNRESTRICTED_PAGE_ROUTES):
+            return await call_next(request)
         if not app.storage.user.get('authenticated', False):
-            if (not request.url.path.startswith('/_nicegui')
-                    and request.url.path not in UNRESTRICTED_PAGE_ROUTES):
-                app.storage.user['referrer_path'] = request.url.path
-                return RedirectResponse('/login')
+            app.storage.user['referrer_path'] = path
+            return RedirectResponse('/login')
         return await call_next(request)
 
 

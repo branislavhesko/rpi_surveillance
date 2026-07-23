@@ -8,15 +8,19 @@ from pydantic import BaseModel
 
 
 class CameraSettings(BaseModel):
-    """Camera connection and display settings."""
-    host: str = "10.10.10.13"
-    port: int = 5000
+    """Camera connection and display settings.
+
+    The camera REST API is now served by the same NiceGUI/FastAPI process under
+    the ``/api`` prefix, so requests target the local server on the app port.
+    """
+    host: str = "127.0.0.1"
+    port: int = 9000
     width: int = 1024
     height: int = 768
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{self.host}:{self.port}/api"
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +43,7 @@ def _create_settings_dialog(settings: CameraSettings):
 
             ui.input(
                 label='Port', value=str(settings.port),
-                on_change=lambda e: setattr(settings, 'port', int(e.value or 5000))
+                on_change=lambda e: setattr(settings, 'port', int(e.value or 9000))
             ).classes('w-full').props('outlined dark color=teal type=number')
 
             ui.separator().style('background:var(--border)')
@@ -187,17 +191,32 @@ def create_live_view_page() -> None:
                 _set_status('error')
                 ui.notify(f'Connection error: {exc}', color='negative', position='top-right')
 
-        def stop_camera() -> None:
+        async def _request(method: str, path: str, timeout: float):
+            """Run a blocking HTTP request in a worker thread.
+
+            The camera REST API is served by the *same* ASGI process, so calling
+            ``requests`` directly from a synchronous handler would block the event
+            loop while it waits for a response that same loop must produce — a
+            self-deadlock that surfaces as a spurious "Connection error". Offload
+            the blocking call to a thread and ``await`` it to keep the loop free.
+            """
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: requests.request(method, f"{settings.url}{path}", timeout=timeout),
+            )
+
+        async def stop_camera() -> None:
             nonlocal is_recording
             try:
                 if is_recording:
-                    requests.get(f"{settings.url}/record/stop", timeout=5)
+                    await _request('GET', '/record/stop', timeout=5)
                     is_recording = False
                     rec_label.style('display:none')
                     record_btn.set_text('Record')
                     record_btn.props('icon=fiber_manual_record color=deep-orange')
-                requests.get(f"{settings.url}/stream/stop", timeout=3)
-                resp = requests.get(f"{settings.url}/stop", timeout=5)
+                await _request('GET', '/stream/stop', timeout=3)
+                resp = await _request('GET', '/stop', timeout=5)
                 if resp.status_code == 200:
                     _stop_stream()
                     start_btn.props(remove='disable')
@@ -209,9 +228,9 @@ def create_live_view_page() -> None:
             except Exception as exc:
                 ui.notify(f'Connection error: {exc}', color='negative', position='top-right')
 
-        def capture_snapshot() -> None:
+        async def capture_snapshot() -> None:
             try:
-                resp = requests.get(f"{settings.url}/save", timeout=5)
+                resp = await _request('GET', '/save', timeout=5)
                 if resp.status_code == 200:
                     fname = resp.json().get('filename', '').split('/')[-1]
                     ui.notify(f'Saved: {fname}', color='positive', icon='photo_camera', position='top-right')
@@ -220,11 +239,11 @@ def create_live_view_page() -> None:
             except Exception as exc:
                 ui.notify(f'Connection error: {exc}', color='negative', position='top-right')
 
-        def toggle_record() -> None:
+        async def toggle_record() -> None:
             nonlocal is_recording
             if not is_recording:
                 try:
-                    resp = requests.get(f"{settings.url}/record/start", timeout=5)
+                    resp = await _request('GET', '/record/start', timeout=5)
                     if resp.status_code == 200:
                         fname = resp.json().get('filename', '').split('/')[-1]
                         is_recording = True
@@ -239,7 +258,7 @@ def create_live_view_page() -> None:
                     ui.notify(f'Connection error: {exc}', color='negative', position='top-right')
             else:
                 try:
-                    resp = requests.get(f"{settings.url}/record/stop", timeout=5)
+                    resp = await _request('GET', '/record/stop', timeout=5)
                     if resp.status_code == 200:
                         fname = resp.json().get('filename', '').split('/')[-1]
                         is_recording = False

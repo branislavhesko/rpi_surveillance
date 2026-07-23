@@ -1,23 +1,31 @@
-import logging
+#!/usr/bin/env python3
+"""Camera backend for rpi_surveillance.
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+Contains the PiCamera2 handler and the FastAPI ``APIRouter`` exposing the camera
+REST endpoints. The router is mounted onto the NiceGUI/FastAPI application in
+``rpi_surveillance.app`` under the ``/api`` prefix, so this module does not run a
+server of its own.
+"""
 
-from fastapi import FastAPI, Depends
-from fastapi.responses import Response, JSONResponse, StreamingResponse
-from pydantic import BaseModel
-from picamera2 import Picamera2
-import numpy as np
-import cv2
 import asyncio
+import logging
 import subprocess
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+import cv2
+import numpy as np
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from picamera2 import Picamera2
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+# Camera REST API is mounted under this prefix on the main app.
+API_PREFIX = "/api"
 
 RECORDINGS_DIR = Path("/home/raspberry/recordings")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,7 +39,7 @@ class Settings(BaseModel):
     resolution: tuple[int, int] = (1024, 768)
     framerate: int = 30
     format: str = "RGB888"
-    
+
     def to_dict(self):
         return {"size": self.resolution, "format": self.format}
 
@@ -62,7 +70,7 @@ class PiCameraHandler:
         except Exception as e:
             self.logger.error(f"Error stopping camera: {e}")
         return self
-    
+
     def close(self):
         """Properly close and release camera resources"""
         self.logger.info("Closing camera and releasing resources")
@@ -76,11 +84,11 @@ class PiCameraHandler:
         except Exception as e:
             self.logger.error(f"Error closing camera: {e}")
         return self
-    
+
     def capture_image(self):
         with self._capture_lock:
             np_array = self.picam2.capture_array()
-            np_array = np.ascontiguousarray(np_array[::-1, :, :])
+            np_array = np.ascontiguousarray(np_array)
         self.logger.info(f"Captured image of size {np_array.shape}")
         return np_array
 
@@ -160,44 +168,32 @@ class PiCameraHandler:
             self.logger.error(f"Error restarting camera: {e}")
             raise
         return self
-    
+
     def reset_camera(self):
         self.close()
         self.picam2 = Picamera2()
         self.picam2.configure(self.picam2.create_preview_configuration(Settings().to_dict()))
         return self
-    
+
     def update_settings(self, settings: Settings):
         self.picam2.configure(self.picam2.create_preview_configuration(settings.to_dict()))
         self.picam2.start()
         return self
 
-app = FastAPI()
 
 class _DependencyInjector:
     def __init__(self):
         self.camera_handler: PiCameraHandler | None = None
-        
+
     def __call__(self):
         return self.camera_handler
-    
+
     def set_camera_handler(self, camera_handler: PiCameraHandler | None):
         self.camera_handler = camera_handler
         return self
-    
-    
+
+
 camera_injector = _DependencyInjector()
-    
-
-@app.get("/")
-def read_root():
-    return {"message": "Hello, World!"}
-
-
-@app.get("/start")
-def start_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
-    camera_handler = _start_camera_internal(camera_handler)
-    return {"message": "Camera started"}
 
 
 def _start_camera_internal(_camera_handler: None | PiCameraHandler):
@@ -213,23 +209,40 @@ def _start_camera_internal(_camera_handler: None | PiCameraHandler):
     return _camera_handler
 
 
-@app.get("/stop")
+# ===========================================================================
+# Camera REST endpoints
+# ===========================================================================
+camera_api = APIRouter(prefix=API_PREFIX, tags=["camera"])
+
+
+@camera_api.get("/")
+def read_root():
+    return {"message": "Hello, World!"}
+
+
+@camera_api.get("/start")
+def start_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
+    _start_camera_internal(camera_handler)
+    return {"message": "Camera started"}
+
+
+@camera_api.get("/stop")
 def stop_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
     if camera_handler is not None:
         camera_handler.reset_camera()
-    return {"message": "Camera stopped"}    
+    return {"message": "Camera stopped"}
 
 
-@app.get("/capture")
+@camera_api.get("/capture")
 def capture_image(camera_handler: PiCameraHandler = Depends(camera_injector)):
     if camera_handler is None:
-        _start_camera_internal(None)
+        camera_handler = _start_camera_internal(None)
     image = camera_handler.capture_image()
     logging.info(f"Captured image of size {image.shape}")
     return Response(content=cv2.imencode('.jpg', image)[1].tobytes(), media_type="image/jpeg")
 
-    
-@app.get("/restart")
+
+@camera_api.get("/restart")
 def restart_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
     if camera_handler is None:
         return JSONResponse(status_code=400, content={"message": "Camera not started"})
@@ -252,13 +265,13 @@ def restart_camera(camera_handler: PiCameraHandler = Depends(camera_injector)):
             return JSONResponse(status_code=500, content={"message": f"Restart failed: {str(e2)}"})
 
 
-@app.post("/update_settings")
+@camera_api.post("/update_settings")
 def update_settings(settings: Settings, camera_handler: PiCameraHandler = Depends(camera_injector)):
     camera_handler.update_settings(settings)
     return {"message": "Settings updated"}
 
 
-@app.get("/stream")
+@camera_api.get("/stream")
 async def stream_video(camera_handler: PiCameraHandler | None = Depends(camera_injector)):
     """Stream live video as MJPEG"""
     if camera_handler is None:
@@ -279,7 +292,7 @@ async def stream_video(camera_handler: PiCameraHandler | None = Depends(camera_i
 
                     # Yield frame in multipart format
                     yield (b'--frame\r\n'
-                            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
                     # Small delay to control frame rate
                     await asyncio.sleep(0.033)  # ~30 fps
@@ -295,7 +308,7 @@ async def stream_video(camera_handler: PiCameraHandler | None = Depends(camera_i
     )
 
 
-@app.get("/stream/stop")
+@camera_api.get("/stream/stop")
 def stop_stream(camera_handler: PiCameraHandler = Depends(camera_injector)):
     """Stop the video stream"""
     if camera_handler:
@@ -303,7 +316,7 @@ def stop_stream(camera_handler: PiCameraHandler = Depends(camera_injector)):
     return {"message": "Stream stopped"}
 
 
-@app.get("/save")
+@camera_api.get("/save")
 def save_image(camera_handler: PiCameraHandler = Depends(camera_injector)):
     """Capture and save the current frame as a JPEG file."""
     if camera_handler is None:
@@ -316,7 +329,7 @@ def save_image(camera_handler: PiCameraHandler = Depends(camera_injector)):
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 
-@app.get("/record/start")
+@camera_api.get("/record/start")
 def start_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
     """Start recording video to an MP4 file."""
     if camera_handler is None:
@@ -329,7 +342,7 @@ def start_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 
-@app.get("/record/stop")
+@camera_api.get("/record/stop")
 def stop_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
     """Stop recording and finalise the video file."""
     if camera_handler is None:
@@ -342,12 +355,3 @@ def stop_recording(camera_handler: PiCameraHandler = Depends(camera_injector)):
     except Exception as e:
         logging.error(f"Error stopping recording: {e}")
         return JSONResponse(status_code=500, content={"message": str(e)})
-
-
-def run_server():
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True, workers=1)
-
-
-if __name__ == "__main__":
-    run_server()

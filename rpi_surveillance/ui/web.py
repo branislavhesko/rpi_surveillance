@@ -8,7 +8,7 @@ from rpi_surveillance.ui.live_view import create_live_view_page
 from rpi_surveillance.ui.record_viewer import create_record_viewer_page
 
 # Serve recordings directory so browser can access videos and images
-app.add_media_files('/media', '/home/raspberry/recordings')
+app.add_media_files('/media', '/home/brani/recordings')
 
 
 # ---------------------------------------------------------------------------

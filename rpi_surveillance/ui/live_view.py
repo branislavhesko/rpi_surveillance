@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+from urllib.parse import quote, urlsplit, urlunsplit
+
 import requests
 from nicegui import ui
 from pydantic import BaseModel
@@ -17,10 +19,28 @@ class CameraSettings(BaseModel):
     port: int = 9000
     width: int = 1024
     height: int = 768
+    source: str = "rtsp"  # 'rtsp' or 'rpi'
+    rtsp_url: str = "rtsp://192.168.50.5:554/stream1"
+    rtsp_user: str = ""
+    rtsp_pass: str = ""
 
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/api"
+
+    @property
+    def authed_rtsp_url(self) -> str:
+        """RTSP URL with credentials injected, if provided and not already present."""
+        if not self.rtsp_user:
+            return self.rtsp_url
+        parts = urlsplit(self.rtsp_url)
+        if '@' in parts.netloc:  # credentials already in the URL
+            return self.rtsp_url
+        userinfo = quote(self.rtsp_user, safe='')
+        if self.rtsp_pass:
+            userinfo += ':' + quote(self.rtsp_pass, safe='')
+        netloc = f"{userinfo}@{parts.netloc}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +65,21 @@ def _create_settings_dialog(settings: CameraSettings):
                 label='Port', value=str(settings.port),
                 on_change=lambda e: setattr(settings, 'port', int(e.value or 9000))
             ).classes('w-full').props('outlined dark color=teal type=number')
+
+            ui.input(
+                label='RTSP URL', value=settings.rtsp_url,
+                on_change=lambda e: setattr(settings, 'rtsp_url', e.value)
+            ).classes('w-full').props('outlined dark color=teal')
+
+            with ui.row().classes('w-full').style('gap:12px'):
+                ui.input(
+                    label='RTSP User', value=settings.rtsp_user,
+                    on_change=lambda e: setattr(settings, 'rtsp_user', e.value)
+                ).classes('col').props('outlined dark color=teal')
+                ui.input(
+                    label='RTSP Password', value=settings.rtsp_pass,
+                    on_change=lambda e: setattr(settings, 'rtsp_pass', e.value)
+                ).classes('col').props('outlined dark color=teal type=password')
 
             ui.separator().style('background:var(--border)')
 
@@ -112,6 +147,22 @@ def create_live_view_page() -> None:
             capture_btn = ui.button('Capture', icon='photo_camera'       ).props('unelevated no-caps color=blue        disable')
             record_btn  = ui.button('Record',  icon='fiber_manual_record').props('unelevated no-caps color=deep-orange disable')
 
+        # ── Camera source ───────────────────────────────────────────────────
+        with ui.row().classes('items-center').style('gap:8px'):
+            ui.icon('switch_camera').style('color:var(--accent); font-size:1.15rem')
+            ui.label('Camera').classes('text-caption').style('color:var(--text-2); font-weight:500')
+            source_toggle = ui.toggle(
+                {'rtsp': 'RTSP', 'rpi': 'RPi Camera'}, value=settings.source,
+                on_change=lambda e: setattr(settings, 'source', e.value),
+            ).props('no-caps dense color=teal').classes('q-ml-sm')
+
+        # ── AI detection toggle ─────────────────────────────────────────────
+        with ui.row().classes('items-center').style('gap:8px'):
+            ui.icon('psychology').style('color:var(--accent); font-size:1.15rem')
+            ui.label('AI Detection').classes('text-caption').style('color:var(--text-2); font-weight:500')
+            detection_radio = ui.radio(['Off', 'On'], value='Off').props(
+                'inline dense color=teal disable').classes('q-ml-sm')
+
         # ── State ─────────────────────────────────────────────────────────
         is_recording = False
 
@@ -138,9 +189,12 @@ def create_live_view_page() -> None:
                 return
             _fetching = True
             try:
+                detecting = detection_radio.value == 'On'
+                endpoint = 'detect' if detecting else 'capture'
+                timeout = 8 if detecting else 5
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(
-                    None, lambda: requests.get(f"{settings.url}/capture", timeout=5)
+                    None, lambda: requests.get(f"{settings.url}/{endpoint}", timeout=timeout)
                 )
                 if resp.status_code == 200:
                     b64 = base64.b64encode(resp.content).decode('ascii')
@@ -175,12 +229,18 @@ def create_live_view_page() -> None:
             loop = asyncio.get_event_loop()
             try:
                 resp = await loop.run_in_executor(
-                    None, lambda: requests.get(f"{settings.url}/start", timeout=15)
+                    None, lambda: requests.get(
+                        f"{settings.url}/start",
+                        params={'source': settings.source, 'url': settings.authed_rtsp_url},
+                        timeout=15,
+                    )
                 )
                 if resp.status_code == 200:
                     _start_stream()
                     for btn in (stop_btn, capture_btn, record_btn):
                         btn.props(remove='disable')
+                    detection_radio.props(remove='disable')
+                    source_toggle.props('disable')
                     ui.notify('Camera started', color='positive', icon='check_circle', position='top-right')
                 else:
                     start_btn.props(remove='disable')
@@ -222,6 +282,9 @@ def create_live_view_page() -> None:
                     start_btn.props(remove='disable')
                     for btn in (stop_btn, capture_btn, record_btn):
                         btn.props('disable')
+                    detection_radio.set_value('Off')
+                    detection_radio.props('disable')
+                    source_toggle.props(remove='disable')
                     ui.notify('Camera stopped', color='info', icon='info', position='top-right')
                 else:
                     ui.notify(f'Failed to stop: {resp.text}', color='negative', position='top-right')

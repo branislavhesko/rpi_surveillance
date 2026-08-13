@@ -6,7 +6,7 @@ from pathlib import Path
 from nicegui import ui
 
 
-RECORDINGS_DIR = Path("/home/raspberry/recordings")
+RECORDINGS_DIR = Path("/home/brani/recordings")
 MEDIA_URL_PREFIX = "/media"
 
 

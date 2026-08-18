@@ -12,6 +12,14 @@ except ImportError:
 
 import os
 from collections import deque
+from typing import NamedTuple
+
+# ── Annotation style ────────────────────────────────────────────────────────
+FONT = cv2.FONT_HERSHEY_DUPLEX
+CHIP_ALPHA = 0.85
+HALO_COLOR = (0, 0, 0)
+# Tracks the tracker kept alive without a matching detection this frame.
+UNMATCHED_TRACK_COLOR = (180, 180, 180)
 
 # Dictionary to store a limited history of tracklet coordinates.
 # The keys will be the track IDs.
@@ -40,46 +48,143 @@ def inference_result_handler(original_frame, infer_results, labels, config_data,
     return frame_with_detections
 
 
-def draw_detection(image: np.ndarray, box: list, labels: list, score: float, color: tuple, track=False):
+class _Style(NamedTuple):
+    """Line and text metrics scaled to the frame resolution."""
+    thickness: int
+    font_scale: float
+    pad: int
+
+
+def _style_for(image: np.ndarray) -> _Style:
+    """Derive drawing metrics so annotations look alike at any resolution."""
+    factor = min(2.0, max(0.65, image.shape[0] / 720.0))
+    return _Style(thickness=max(1, round(2 * factor)),
+                  font_scale=0.55 * factor,
+                  pad=max(3, round(6 * factor)))
+
+
+def _readable_text_color(background: tuple) -> tuple:
+    """Pick black or white text, whichever contrasts better with *background*."""
+    blue, green, red = background[:3]
+    return (0, 0, 0) if 0.114 * blue + 0.587 * green + 0.299 * red > 150 else (255, 255, 255)
+
+
+def _blend_rect(image: np.ndarray, pt1: tuple, pt2: tuple, color: tuple, alpha: float) -> None:
+    """Alpha-blend a solid rectangle onto the image, clipped to its bounds."""
+    height, width = image.shape[:2]
+    x1, x2 = sorted((max(0, min(pt1[0], width)), max(0, min(pt2[0], width))))
+    y1, y2 = sorted((max(0, min(pt1[1], height)), max(0, min(pt2[1], height))))
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = image[y1:y2, x1:x2]
+    cv2.addWeighted(np.full_like(roi, color), alpha, roi, 1 - alpha, 0, dst=roi)
+
+
+def _draw_corner_brackets(image: np.ndarray, box: tuple, color: tuple, thickness: int) -> None:
+    """Draw L-shaped corners over the box, each backed by a dark halo.
+
+    The halo keeps the marker legible over both bright and dark scenery.
+    """
+    xmin, ymin, xmax, ymax = box
+    length = max(8, int(min(xmax - xmin, ymax - ymin) * 0.22))
+    for x, step_x in ((xmin, 1), (xmax, -1)):
+        for y, step_y in ((ymin, 1), (ymax, -1)):
+            for stroke_color, stroke in ((HALO_COLOR, thickness + 2), (color, thickness)):
+                cv2.line(image, (x, y), (x + step_x * length, y), stroke_color, stroke, cv2.LINE_AA)
+                cv2.line(image, (x, y), (x, y + step_y * length), stroke_color, stroke, cv2.LINE_AA)
+
+
+def _chip_size(text: str, style: _Style, font_scale: float | None = None) -> tuple[int, int]:
+    """Return the (width, height) a label chip needs to hold *text*."""
+    (text_w, text_h), baseline = cv2.getTextSize(text, FONT, font_scale or style.font_scale, 1)
+    return text_w + 2 * style.pad, text_h + baseline + 2 * style.pad
+
+
+def _draw_chip(image: np.ndarray, text: str, top_left: tuple, bg_color: tuple, style: _Style,
+               fg_color: tuple | None = None, alpha: float = CHIP_ALPHA,
+               font_scale: float | None = None) -> tuple[int, int, int, int]:
+    """Draw a filled label chip, nudged to stay inside the frame.
+
+    Returns:
+        tuple: The chip rectangle as (x1, y1, x2, y2).
+    """
+    scale = font_scale or style.font_scale
+    chip_w, chip_h = _chip_size(text, style, scale)
+    height, width = image.shape[:2]
+    x1 = max(0, min(top_left[0], width - chip_w))
+    y1 = max(0, min(top_left[1], height - chip_h))
+    x2, y2 = x1 + chip_w, y1 + chip_h
+
+    _blend_rect(image, (x1, y1), (x2, y2), bg_color, alpha)
+    (_, text_h), _ = cv2.getTextSize(text, FONT, scale, 1)
+    cv2.putText(image, text, (x1 + style.pad, y1 + style.pad + text_h), FONT, scale,
+                fg_color or _readable_text_color(bg_color), 1, cv2.LINE_AA)
+    return x1, y1, x2, y2
+
+
+def _draw_confidence_meter(image: np.ndarray, chip: tuple, score: float, style: _Style) -> None:
+    """Fill the bottom edge of a chip proportionally to the detection score."""
+    x1, _, x2, y2 = chip
+    bar_h = max(3, style.thickness + 1)
+    filled = int((x2 - x1) * min(max(score, 0.0), 100.0) / 100.0)
+    _blend_rect(image, (x1, y2 - bar_h), (x2, y2), HALO_COLOR, 0.75)
+    _blend_rect(image, (x1, y2 - bar_h), (x1 + filled, y2), (255, 255, 255), 1.0)
+
+
+def draw_detection(image: np.ndarray, box: list, labels: list | str, score: float,
+                   color: tuple, track: bool = False) -> None:
     """
     Draw box and label for one detection.
+
+    The box is marked with a thin outline plus bright corner brackets, and the
+    class/score is shown in a filled chip above it whose bottom edge doubles as
+    a confidence meter. A tracking ID, when present, gets its own dark badge in
+    the bottom-right corner so it never collides with the class label.
 
     Args:
         image (np.ndarray): Image to draw on.
         box (list): Bounding box coordinates.
-        labels (list): List of labels (1 or 2 elements).
-        score (float): Detection score.
+        labels (list | str): Class label, tracking tag, or both.
+        score (float): Detection score, as a percentage.
         color (tuple): Color for the bounding box.
         track (bool): Whether to include tracking info.
     """
-    xmin, ymin, xmax, ymax = map(int, box)
-    cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    if isinstance(labels, str):
+        labels = [labels]
 
-    # Compose texts
-    top_text = f"{labels[0]}: {score:.1f}%" if not track or len(labels) == 2 else f"{score:.1f}%"
-    bottom_text = None
+    height, width = image.shape[:2]
+    xmin, ymin, xmax, ymax = (int(coord) for coord in box)
+    xmin, xmax = max(0, min(xmin, width - 1)), max(0, min(xmax, width - 1))
+    ymin, ymax = max(0, min(ymin, height - 1)), max(0, min(ymax, height - 1))
+    if xmax - xmin < 2 or ymax - ymin < 2:
+        return
 
-    if track:
-        if len(labels) == 2:
-            bottom_text = labels[1]
-        else:
-            bottom_text = labels[0]
+    style = _style_for(image)
+    color = tuple(int(channel) for channel in color[:3])
 
+    cv2.rectangle(image, (xmin, ymin), (xmax, ymax), HALO_COLOR, style.thickness + 1, cv2.LINE_AA)
+    cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, max(1, style.thickness - 1), cv2.LINE_AA)
+    _draw_corner_brackets(image, (xmin, ymin, xmax, ymax), color, style.thickness + 1)
 
-    # Set colors
-    text_color = (255, 255, 255)  # White
-    border_color = (0, 0, 0)  # Black
+    # Without a matching detection the tracker only knows the ID, so the single
+    # label is the tracking tag rather than a class name.
+    if track and len(labels) == 1:
+        class_name, track_tag = None, labels[0]
+    else:
+        class_name = labels[0] if labels else None
+        track_tag = labels[1] if len(labels) > 1 else None
 
-    # Draw top text with black border first
-    cv2.putText(image, top_text, (xmin + 4, ymin + 20), font, 0.5, border_color, 2, cv2.LINE_AA)
-    cv2.putText(image, top_text, (xmin + 4, ymin + 20), font, 0.5, text_color, 1, cv2.LINE_AA)
+    title = f"{class_name}  {score:.0f}%" if class_name else f"{score:.0f}%"
+    _, chip_h = _chip_size(title, style)
+    chip_y = ymin - chip_h if ymin - chip_h >= 0 else ymin
+    chip = _draw_chip(image, title, (xmin, chip_y), color, style)
+    _draw_confidence_meter(image, chip, score, style)
 
-    # Draw bottom text if exists
-    if bottom_text:
-        pos = (xmax - 50, ymax - 6)
-        cv2.putText(image, bottom_text, pos, font, 0.5, border_color, 2, cv2.LINE_AA)
-        cv2.putText(image, bottom_text, pos, font, 0.5, text_color, 1, cv2.LINE_AA)
+    if track_tag:
+        badge_scale = style.font_scale * 0.9
+        badge_w, badge_h = _chip_size(track_tag, style, badge_scale)
+        _draw_chip(image, track_tag, (xmax - badge_w, ymax - badge_h), HALO_COLOR, style,
+                   fg_color=color, alpha=0.7, font_scale=badge_scale)
 
 
 def denormalize_and_rm_pad(box: list, size: int, padding_length: int, input_height: int, input_width: int) -> list:
@@ -201,14 +306,15 @@ def draw_detections(detections: dict, img_out: np.ndarray, labels, tracker=None,
             x1, y1, x2, y2 = track.tlbr  # Bounding box (top-left, bottom-right)
             xmin, ymin, xmax, ymax = map(int, [x1, y1, x2, y2])
             best_idx = find_best_matching_detection_index(track.tlbr, boxes)
-            color = tuple(id_to_color(classes[best_idx]).tolist())  # Color based on class
             if best_idx is None:
                 draw_detection(img_out, [xmin, ymin, xmax, ymax], f"ID {track_id}",
-                               track.score * 100.0, color, track=True)
-            else:
-                draw_detection(img_out, [xmin, ymin, xmax, ymax], [labels[classes[best_idx]], f"ID {track_id}"],
-                               track.score * 100.0, color, track=True)
-                               
+                               track.score * 100.0, UNMATCHED_TRACK_COLOR, track=True)
+                continue
+
+            color = tuple(id_to_color(classes[best_idx]).tolist())  # Color based on class
+            draw_detection(img_out, [xmin, ymin, xmax, ymax], [labels[classes[best_idx]], f"ID {track_id}"],
+                           track.score * 100.0, color, track=True)
+
             if not classes[best_idx] in TRACKLET_CLASSES:
                 continue
 

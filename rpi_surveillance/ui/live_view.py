@@ -1,12 +1,19 @@
 """Live surveillance view with real-time camera streaming."""
 
 import asyncio
-import base64
-from urllib.parse import quote, urlsplit, urlunsplit
+import time
+from collections.abc import Callable
+from urllib.parse import urlencode
 
 import requests
 from nicegui import ui
 from pydantic import BaseModel
+
+# Control calls are made server-side against the local API; the live image is
+# fetched by the browser, so it uses this same prefix as a relative path.
+API_PATH = "/api"
+
+STREAM_WIDTHS = {1920: '1920 · full', 1280: '1280 · recommended', 960: '960 · low', 640: '640 · minimal'}
 
 
 class CameraSettings(BaseModel):
@@ -17,36 +24,26 @@ class CameraSettings(BaseModel):
     """
     host: str = "127.0.0.1"
     port: int = 9000
-    width: int = 1024
-    height: int = 768
+    width: int = 1920
+    height: int = 1080
     source: str = "rtsp"  # 'rtsp' or 'rpi'
+    # Host/path only — credentials live server-side (RTSP_CREDENTIALS in .env) and
+    # are injected by the backend, so the password never travels through the browser.
     rtsp_url: str = "rtsp://192.168.50.5:554/stream1"
-    rtsp_user: str = ""
-    rtsp_pass: str = ""
+    # Live preview is downscaled server-side; the frame pane is under 1000px
+    # wide, so streaming full 1080p just wastes bandwidth.
+    stream_width: int = 1280
+    stream_quality: int = 75
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}/api"
-
-    @property
-    def authed_rtsp_url(self) -> str:
-        """RTSP URL with credentials injected, if provided and not already present."""
-        if not self.rtsp_user:
-            return self.rtsp_url
-        parts = urlsplit(self.rtsp_url)
-        if '@' in parts.netloc:  # credentials already in the URL
-            return self.rtsp_url
-        userinfo = quote(self.rtsp_user, safe='')
-        if self.rtsp_pass:
-            userinfo += ':' + quote(self.rtsp_pass, safe='')
-        netloc = f"{userinfo}@{parts.netloc}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        return f"http://{self.host}:{self.port}{API_PATH}"
 
 
 # ---------------------------------------------------------------------------
 # Settings dialog
 # ---------------------------------------------------------------------------
-def _create_settings_dialog(settings: CameraSettings):
+def _create_settings_dialog(settings: CameraSettings, on_stream_change: Callable[[], None]):
     with ui.dialog() as dialog, ui.card().classes('sv-card q-pa-md').style('min-width:300px; width:min(440px, 90vw)'):
         with ui.row().classes('items-center q-mb-md').style('gap:8px'):
             ui.icon('tune').style('color:var(--accent)')
@@ -71,15 +68,10 @@ def _create_settings_dialog(settings: CameraSettings):
                 on_change=lambda e: setattr(settings, 'rtsp_url', e.value)
             ).classes('w-full').props('outlined dark color=teal')
 
-            with ui.row().classes('w-full').style('gap:12px'):
-                ui.input(
-                    label='RTSP User', value=settings.rtsp_user,
-                    on_change=lambda e: setattr(settings, 'rtsp_user', e.value)
-                ).classes('col').props('outlined dark color=teal')
-                ui.input(
-                    label='RTSP Password', value=settings.rtsp_pass,
-                    on_change=lambda e: setattr(settings, 'rtsp_pass', e.value)
-                ).classes('col').props('outlined dark color=teal type=password')
+            with ui.row().classes('items-center').style('gap:6px'):
+                ui.icon('lock').style('color:var(--text-3); font-size:0.95rem')
+                ui.label('Credentials are configured server-side via RTSP_CREDENTIALS in .env').classes(
+                    'text-caption').style('color:var(--text-3)')
 
             ui.separator().style('background:var(--border)')
 
@@ -88,13 +80,29 @@ def _create_settings_dialog(settings: CameraSettings):
 
             ui.select(
                 label='Resolution',
-                options=[(1024, 768), (1920, 1080)],
+                options=[(1920, 1080)],
                 value=(settings.width, settings.height),
                 on_change=lambda e: (
                     setattr(settings, 'width',  e.value[0]),
                     setattr(settings, 'height', e.value[1]),
                 )
             ).classes('w-full').props('outlined dark color=teal')
+
+            def _set_stream_width(value: int) -> None:
+                settings.stream_width = value
+                on_stream_change()
+
+            ui.select(
+                label='Preview quality',
+                options=STREAM_WIDTHS,
+                value=settings.stream_width,
+                on_change=lambda e: _set_stream_width(e.value),
+            ).classes('w-full').props('outlined dark color=teal')
+
+            with ui.row().classes('items-center').style('gap:6px'):
+                ui.icon('speed').style('color:var(--text-3); font-size:0.95rem')
+                ui.label('Lower widths cut bandwidth; recordings stay at full resolution').classes(
+                    'text-caption').style('color:var(--text-3)')
 
         with ui.row().classes('w-full justify-end q-mt-sm'):
             ui.button('Close', on_click=dialog.close).props('flat no-caps color=teal')
@@ -108,7 +116,6 @@ def _create_settings_dialog(settings: CameraSettings):
 def create_live_view_page() -> None:
     """Create the live surveillance view page component."""
     settings = CameraSettings()
-    settings_dialog = _create_settings_dialog(settings)
 
     with ui.column().classes('w-full q-pa-md').style('gap:16px; max-width:1000px; margin:0 auto'):
 
@@ -117,7 +124,9 @@ def create_live_view_page() -> None:
             with ui.row().classes('items-center').style('gap:8px'):
                 ui.icon('videocam').style('color:var(--accent); font-size:1.3rem')
                 ui.label('Live View').classes('text-h5 text-weight-bold').style('color:var(--text-1)')
-            ui.button(icon='tune', on_click=settings_dialog.open).props(
+            # The dialog is built further down, once the stream helpers it needs
+            # to call on change exist; the lambda defers the lookup until click.
+            ui.button(icon='tune', on_click=lambda: settings_dialog.open()).props(
                 'flat round dense color=grey-5').tooltip('Settings')
 
         # ── Status row ────────────────────────────────────────────────────
@@ -134,10 +143,13 @@ def create_live_view_page() -> None:
             )
             with nosig_label:
                 ui.label('No signal')
-            cam_img = ui.image().style(
+            # A plain <img> pointed at the MJPEG endpoint: the browser pulls
+            # frames over HTTP instead of them being pushed through NiceGUI's
+            # websocket, so a slow client drops frames rather than lagging.
+            cam_img = ui.interactive_image().style(
                 'position:absolute; top:0; left:0; width:100%; height:100%;'
                 'object-fit:contain;'
-            ).props('no-transition no-spinner')
+            )
             cam_img.visible = False
 
         # ── Controls ──────────────────────────────────────────────────────
@@ -148,13 +160,48 @@ def create_live_view_page() -> None:
             record_btn  = ui.button('Record',  icon='fiber_manual_record').props('unelevated no-caps color=deep-orange disable')
 
         # ── Camera source ───────────────────────────────────────────────────
-        with ui.row().classes('items-center').style('gap:8px'):
+        _CAM_OPTIONS = [('rtsp', 'RTSP', 'cast'), ('rpi', 'RPi Camera', 'camera')]
+        source_locked = False  # True while a camera is running
+
+        with ui.row().classes('items-center').style('gap:10px'):
             ui.icon('switch_camera').style('color:var(--accent); font-size:1.15rem')
             ui.label('Camera').classes('text-caption').style('color:var(--text-2); font-weight:500')
-            source_toggle = ui.toggle(
-                {'rtsp': 'RTSP', 'rpi': 'RPi Camera'}, value=settings.source,
-                on_change=lambda e: setattr(settings, 'source', e.value),
-            ).props('no-caps dense color=teal').classes('q-ml-sm')
+            with ui.row().classes('items-center q-pa-xs').style(
+                'gap:8px; border:1px solid var(--border); border-radius:10px'
+            ):
+                source_btns: dict[str, ui.button] = {}
+                for _val, _lbl, _icon in _CAM_OPTIONS:
+                    source_btns[_val] = ui.button(
+                        _lbl, icon=_icon,
+                        on_click=lambda _v=_val: _select_source(_v),
+                    ).props('unelevated no-caps dense')
+
+        def _refresh_source_buttons() -> None:
+            """Active camera → solid green; inactive → outlined red."""
+            for val, btn in source_btns.items():
+                if val == settings.source:
+                    btn.props(remove='outline color=negative')
+                    btn.props('unelevated color=positive')
+                else:
+                    btn.props(remove='unelevated color=positive')
+                    btn.props('outline color=negative')
+                if source_locked and val != settings.source:
+                    btn.props('disable')
+                else:
+                    btn.props(remove='disable')
+
+        def _select_source(value: str) -> None:
+            if source_locked:
+                return
+            settings.source = value
+            _refresh_source_buttons()
+
+        def _set_source_locked(locked: bool) -> None:
+            nonlocal source_locked
+            source_locked = locked
+            _refresh_source_buttons()
+
+        _refresh_source_buttons()
 
         # ── AI detection toggle ─────────────────────────────────────────────
         with ui.row().classes('items-center').style('gap:8px'):
@@ -179,48 +226,48 @@ def create_live_view_page() -> None:
             status_label.set_text(text)
             status_label.style(f'color:{color}')
 
-        # ── Frame polling ────────────────────────────────────────────────
-        _fetching = False
-        _last_b64 = ''
+        # ── Live stream ───────────────────────────────────────────────────
+        _streaming = False
 
-        async def _poll_frame() -> None:
-            nonlocal _fetching, _last_b64
-            if _fetching:
-                return
-            _fetching = True
-            try:
-                detecting = detection_radio.value == 'On'
-                endpoint = 'detect' if detecting else 'capture'
-                timeout = 8 if detecting else 5
-                loop = asyncio.get_event_loop()
-                resp = await loop.run_in_executor(
-                    None, lambda: requests.get(f"{settings.url}/{endpoint}", timeout=timeout)
-                )
-                if resp.status_code == 200:
-                    b64 = base64.b64encode(resp.content).decode('ascii')
-                    # Only update if this is a different frame (skip black dupes)
-                    if b64 != _last_b64:
-                        _last_b64 = b64
-                        cam_img.set_source(f'data:image/jpeg;base64,{b64}')
-            except Exception:
-                pass
-            finally:
-                _fetching = False
+        def _stream_url() -> str:
+            """Build the MJPEG URL for the current settings.
 
-        frame_timer = ui.timer(0.15, _poll_frame, active=False)
+            Relative, so the browser streams from whichever host served the page
+            rather than the backend's own loopback address. The timestamp makes
+            every URL unique, which forces the browser to drop the in-flight
+            response and reconnect when options change.
+            """
+            params = {
+                'detect': str(detection_radio.value == 'On').lower(),
+                'width': settings.stream_width,
+                'quality': settings.stream_quality,
+                't': int(time.time() * 1000),
+            }
+            return f"{API_PATH}/stream?{urlencode(params)}"
+
+        def _refresh_stream() -> None:
+            """Reconnect the stream so changed options take effect."""
+            if _streaming:
+                cam_img.set_source(_stream_url())
 
         def _start_stream() -> None:
+            nonlocal _streaming
+            _streaming = True
             nosig_label.visible = False
             cam_img.visible = True
-            frame_timer.active = True
+            cam_img.set_source(_stream_url())
             _set_status('online')
 
         def _stop_stream() -> None:
-            frame_timer.active = False
+            nonlocal _streaming
+            _streaming = False
             cam_img.visible = False
             cam_img.set_source('')
             nosig_label.visible = True
             _set_status('offline')
+
+        detection_radio.on_value_change(lambda _: _refresh_stream())
+        settings_dialog = _create_settings_dialog(settings, _refresh_stream)
 
         # ── Button handlers ───────────────────────────────────────────────
         async def start_camera() -> None:
@@ -231,7 +278,7 @@ def create_live_view_page() -> None:
                 resp = await loop.run_in_executor(
                     None, lambda: requests.get(
                         f"{settings.url}/start",
-                        params={'source': settings.source, 'url': settings.authed_rtsp_url},
+                        params={'source': settings.source, 'url': settings.rtsp_url},
                         timeout=15,
                     )
                 )
@@ -240,7 +287,7 @@ def create_live_view_page() -> None:
                     for btn in (stop_btn, capture_btn, record_btn):
                         btn.props(remove='disable')
                     detection_radio.props(remove='disable')
-                    source_toggle.props('disable')
+                    _set_source_locked(True)
                     ui.notify('Camera started', color='positive', icon='check_circle', position='top-right')
                 else:
                     start_btn.props(remove='disable')
@@ -284,7 +331,7 @@ def create_live_view_page() -> None:
                         btn.props('disable')
                     detection_radio.set_value('Off')
                     detection_radio.props('disable')
-                    source_toggle.props(remove='disable')
+                    _set_source_locked(False)
                     ui.notify('Camera stopped', color='info', icon='info', position='top-right')
                 else:
                     ui.notify(f'Failed to stop: {resp.text}', color='negative', position='top-right')
@@ -345,6 +392,7 @@ def create_live_view_page() -> None:
         with ui.card().classes('sv-card w-full q-pa-sm'):
             with ui.row().classes('items-center q-gutter-md row wrap'):
                 ui.icon('lan').style('color:var(--text-3); font-size:1rem')
-                for attr, fmt in [('host', '{}'), ('port', ':{}'), ('width', '{}px'), ('height', '{}px')]:
+                for attr, fmt in [('host', '{}'), ('port', ':{}'), ('width', '{}px'), ('height', '{}px'),
+                                  ('stream_width', 'preview {}px')]:
                     ui.label().classes('text-caption').style('color:var(--text-3)').bind_text_from(
                         settings, attr, lambda v, f=fmt: f.format(v))

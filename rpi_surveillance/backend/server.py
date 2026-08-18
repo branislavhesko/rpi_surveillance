@@ -10,390 +10,82 @@ server of its own.
 import asyncio
 import logging
 import os
-import subprocess
 import threading
 import time
-from datetime import datetime
-from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import cv2
 import numpy as np
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
-
-# PiCamera2 is optional now that the backend defaults to an RTSP camera. Keep the
-# import guarded so the module still loads on machines without the library.
 try:
     from picamera2 import Picamera2
 except Exception:  # pragma: no cover - only present on a Raspberry Pi
     Picamera2 = None
 
+
+
+from rpi_surveillance.backend.camera import (
+    DEFAULT_RTSP_URL,
+    JPEG_QUALITY,
+    RTSPCameraHandler,
+    PiCameraHandler,
+    Settings,
+)
 from rpi_surveillance.backend.inference.detector import ObjectDetector
+from rpi_surveillance.config import load_env
 
 logger = logging.getLogger(__name__)
 
 # Camera REST API is mounted under this prefix on the main app.
 API_PREFIX = "/api"
+STREAM_WIDTH = 1280
+STREAM_QUALITY = 75
+STREAM_MAX_FPS = 15.0
+
+# Ensure .env (RTSP credentials etc.) is loaded before reading env vars below.
+load_env()
 
 # Default RTSP source; overridable via the ``RTSP_URL`` env var or the ``/start``
-# endpoint's ``url`` query parameter.
+# endpoint's ``url`` query parameter. ``RTSP_CREDENTIALS`` (``user:pass``) is
+# injected server-side so credentials never travel through the browser.
 DEFAULT_RTSP_URL = os.environ.get("RTSP_URL", "rtsp://192.168.50.5:554/stream1")
 
-RECORDINGS_DIR = Path("/home/brani/recordings")
-RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# libcamera allows only one Picamera2 object per camera per process. Constructing
-# a fresh Picamera2() on every start double-acquires the device and fails with
-# "Camera in Configured state trying acquire() requiring state Available", so we
-# keep a single shared instance and reuse it.
-_PICAM2 = None
-_PICAM2_LOCK = threading.Lock()
+def _resolve_rtsp_url(url: str | None) -> str:
+    """Return the RTSP URL to connect to, injecting server-side credentials.
 
-
-def _get_picam2():
-    """Return the process-wide Picamera2 singleton, creating it on first use."""
-    global _PICAM2
-    if Picamera2 is None:
-        raise RuntimeError("PiCamera2 is not available on this machine")
-    with _PICAM2_LOCK:
-        if _PICAM2 is None:
-            _PICAM2 = Picamera2()
-        return _PICAM2
-
-
-def _transform_image(image: np.ndarray) -> np.ndarray:
-    return np.flip(image, axis=0)
-
-
-class Settings(BaseModel):
-    resolution: tuple[int, int] = (1024, 768)
-    framerate: int = 30
-    format: str = "RGB888"
-
-    def to_dict(self):
-        return {"size": self.resolution, "format": self.format}
-
-
-class PiCameraHandler:
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("Initializing camera")
-        self.picam2 = _get_picam2()
-        self._settings = Settings()
-        # Make sure the shared instance is stopped before reconfiguring it.
-        try:
-            self.picam2.stop()
-        except Exception:
-            pass
-        self.picam2.configure(self.picam2.create_preview_configuration(self._settings.to_dict()))
-        self.streaming_active = False
-        self._recording = False
-        self._recording_proc: subprocess.Popen | None = None
-        self._recording_thread: threading.Thread | None = None
-        self._recording_path: str | None = None
-        self._capture_lock = threading.Lock()
-
-    def start(self):
-        self.logger.info("Starting camera")
-        self.picam2.start()
-        return self
-
-    def stop(self):
-        self.logger.info("Stopping camera")
-        try:
-            self.picam2.stop()
-        except Exception as e:
-            self.logger.error(f"Error stopping camera: {e}")
-        return self
-
-    def close(self):
-        """Stop the shared camera instance (kept alive for reuse across handlers)."""
-        self.logger.info("Stopping camera and releasing pipeline")
-        self.stop_recording()
-        try:
-            self.picam2.stop()
-        except Exception as e:
-            self.logger.warning(f"Error stopping camera during close: {e}")
-        return self
-
-    def capture_image(self):
-        with self._capture_lock:
-            np_array = self.picam2.capture_array()
-            np_array = np.ascontiguousarray(np_array)
-        self.logger.info(f"Captured image of size {np_array.shape}")
-        return np_array
-
-    def save_image(self) -> str:
-        """Capture and save a single frame as JPEG."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = str(RECORDINGS_DIR / f"capture_{timestamp}.jpg")
-        frame = self.capture_image()
-        cv2.imwrite(filename, frame)
-        self.logger.info(f"Saved image to {filename}")
-        return filename
-
-    def start_recording(self) -> str:
-        """Start recording video to an MP4 file (H.264 via ffmpeg)."""
-        if self._recording:
-            return self._recording_path
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._recording_path = str(RECORDINGS_DIR / f"video_{timestamp}.mp4")
-        frame = self.capture_image()
-        h, w = frame.shape[:2]
-        self._recording_proc = subprocess.Popen(
-            ['ffmpeg', '-y',
-             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-             '-s', f'{w}x{h}', '-r', '15',
-             '-i', '-',
-             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-             '-pix_fmt', 'yuv420p',
-             self._recording_path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._recording = True
-        self._recording_thread = threading.Thread(target=self._record_loop, daemon=True)
-        self._recording_thread.start()
-        self.logger.info(f"Started recording to {self._recording_path}")
-        return self._recording_path
-
-    def _record_loop(self):
-        """Background thread: capture frames and pipe to ffmpeg."""
-        while self._recording:
-            try:
-                frame = self.capture_image()
-                self._recording_proc.stdin.write(frame.tobytes())
-            except Exception as e:
-                self.logger.error(f"Error recording frame: {e}")
-                break
-            time.sleep(1 / 15)
-
-    def stop_recording(self) -> str | None:
-        """Stop recording and finalise the video file."""
-        if not self._recording:
-            return None
-        self._recording = False
-        if self._recording_thread:
-            self._recording_thread.join(timeout=5)
-            self._recording_thread = None
-        if self._recording_proc:
-            try:
-                self._recording_proc.stdin.close()
-                self._recording_proc.wait(timeout=30)
-            except Exception as e:
-                self.logger.error(f"Error finalizing recording: {e}")
-                self._recording_proc.kill()
-            self._recording_proc = None
-        path = self._recording_path
-        self._recording_path = None
-        self.logger.info(f"Stopped recording, saved to {path}")
-        return path
-
-    def restart_camera(self):
-        """Restart the camera by stopping and starting it"""
-        self.logger.info("Restarting camera")
-        try:
-            self.picam2.stop()
-            self.picam2.start()
-            self.logger.info("Camera restarted successfully")
-        except Exception as e:
-            self.logger.error(f"Error restarting camera: {e}")
-            raise
-        return self
-
-    def reset_camera(self):
-        self.close()
-        self.picam2 = _get_picam2()
-        self.picam2.configure(self.picam2.create_preview_configuration(Settings().to_dict()))
-        return self
-
-    def update_settings(self, settings: Settings):
-        self.picam2.configure(self.picam2.create_preview_configuration(settings.to_dict()))
-        self.picam2.start()
-        return self
-
-
-class RTSPCameraHandler:
-    """Camera handler backed by an RTSP stream via OpenCV.
-
-    Exposes the same interface as :class:`PiCameraHandler` (``start``/``stop``/
-    ``capture_image``/recording helpers), so the REST endpoints work unchanged.
-    A background thread continuously grabs frames and keeps only the latest one,
-    which avoids the growing latency you get when reading an RTSP stream on
-    demand. Frames are returned in BGR order (OpenCV's native layout), which is
-    exactly what ``cv2.imencode`` and the detector's ``BGR2RGB`` step expect.
+    If ``RTSP_CREDENTIALS`` (``user:pass``) is set and the URL has no embedded
+    credentials, they are added here on the server. A URL that already carries
+    credentials is left untouched.
     """
+    url = url or DEFAULT_RTSP_URL
+    creds = os.environ.get("RTSP_CREDENTIALS", "").strip()
+    if not creds:
+        return url
+    parts = urlsplit(url)
+    if '@' in parts.netloc:  # credentials already present
+        return url
+    user, _, password = creds.partition(':')
+    userinfo = quote(user, safe='')
+    if password:
+        userinfo += ':' + quote(password, safe='')
+    netloc = f"{userinfo}@{parts.netloc}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
-    def __init__(self, url: str = DEFAULT_RTSP_URL):
-        self.logger = logging.getLogger(__name__)
-        self.url = url
-        self.logger.info(f"Initializing RTSP camera: {url}")
-        self.cap: cv2.VideoCapture | None = None
-        self.streaming_active = False
-        self._recording = False
-        self._recording_proc: subprocess.Popen | None = None
-        self._recording_thread: threading.Thread | None = None
-        self._recording_path: str | None = None
-        self._frame_lock = threading.Lock()
-        self._latest_frame: np.ndarray | None = None
-        self._reader_thread: threading.Thread | None = None
-        self._running = False
 
-    def _open_capture(self) -> cv2.VideoCapture:
-        # Force TCP transport and a connection timeout (5s, in microseconds).
-        # Many IP cameras refuse the default UDP transport or hang silently.
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
-        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        # Keep only the newest frame buffered to minimise latency.
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        return cap
+def _scale_to_width(frame: np.ndarray, width: int | None) -> np.ndarray:
+    """Downscale ``frame`` to ``width`` px wide, preserving aspect ratio."""
+    if not width or width >= frame.shape[1]:
+        return frame
+    height = int(round(frame.shape[0] * width / frame.shape[1]))
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
-    def start(self):
-        self.logger.info(f"Opening RTSP stream {self.url}")
-        self.cap = self._open_capture()
-        if not self.cap.isOpened():
-            self.cap.release()
-            self.cap = None
-            raise RuntimeError(f"Could not open RTSP stream: {self.url}")
-        self._running = True
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
-        return self
 
-    def _reader_loop(self):
-        """Continuously pull frames, reconnecting on failure."""
-        while self._running:
-            if self.cap is None:
-                self.cap = self._open_capture()
-            ok, frame = self.cap.read()
-            if not ok or frame is None:
-                self.logger.warning("RTSP read failed; attempting to reconnect")
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
-                time.sleep(0.5)
-                continue
-            with self._frame_lock:
-                self._latest_frame = frame
-
-    def stop(self):
-        self.logger.info("Stopping RTSP camera")
-        self._running = False
-        if self._reader_thread:
-            self._reader_thread.join(timeout=5)
-            self._reader_thread = None
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                self.logger.error(f"Error releasing RTSP capture: {e}")
-            self.cap = None
-        with self._frame_lock:
-            self._latest_frame = None
-        return self
-
-    def close(self):
-        """Stop recording, tear down the reader thread and release the stream."""
-        self.logger.info("Closing RTSP camera and releasing resources")
-        self.stop_recording()
-        self.stop()
-        return self
-
-    def capture_image(self, timeout: float = 10.0):
-        """Return the most recent frame, waiting briefly for the stream to warm up."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with self._frame_lock:
-                if self._latest_frame is not None:
-                    frame = np.ascontiguousarray(self._latest_frame)
-                    return frame
-            time.sleep(0.05)
-        raise RuntimeError(f"No frame available from RTSP stream: {self.url}")
-
-    def save_image(self) -> str:
-        """Capture and save a single frame as JPEG."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = str(RECORDINGS_DIR / f"capture_{timestamp}.jpg")
-        frame = self.capture_image()
-        cv2.imwrite(filename, frame)
-        self.logger.info(f"Saved image to {filename}")
-        return filename
-
-    def start_recording(self) -> str:
-        """Start recording video to an MP4 file (H.264 via ffmpeg)."""
-        if self._recording:
-            return self._recording_path
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._recording_path = str(RECORDINGS_DIR / f"video_{timestamp}.mp4")
-        frame = self.capture_image()
-        h, w = frame.shape[:2]
-        self._recording_proc = subprocess.Popen(
-            ['ffmpeg', '-y',
-             '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-             '-s', f'{w}x{h}', '-r', '15',
-             '-i', '-',
-             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-             '-pix_fmt', 'yuv420p',
-             self._recording_path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._recording = True
-        self._recording_thread = threading.Thread(target=self._record_loop, daemon=True)
-        self._recording_thread.start()
-        self.logger.info(f"Started recording to {self._recording_path}")
-        return self._recording_path
-
-    def _record_loop(self):
-        """Background thread: capture frames and pipe to ffmpeg."""
-        while self._recording:
-            try:
-                frame = self.capture_image()
-                self._recording_proc.stdin.write(frame.tobytes())
-            except Exception as e:
-                self.logger.error(f"Error recording frame: {e}")
-                break
-            time.sleep(1 / 15)
-
-    def stop_recording(self) -> str | None:
-        """Stop recording and finalise the video file."""
-        if not self._recording:
-            return None
-        self._recording = False
-        if self._recording_thread:
-            self._recording_thread.join(timeout=5)
-            self._recording_thread = None
-        if self._recording_proc:
-            try:
-                self._recording_proc.stdin.close()
-                self._recording_proc.wait(timeout=30)
-            except Exception as e:
-                self.logger.error(f"Error finalizing recording: {e}")
-                self._recording_proc.kill()
-            self._recording_proc = None
-        path = self._recording_path
-        self._recording_path = None
-        self.logger.info(f"Stopped recording, saved to {path}")
-        return path
-
-    def restart_camera(self):
-        """Reconnect to the RTSP stream."""
-        self.logger.info("Restarting RTSP camera")
-        self.stop()
-        self.start()
-        return self
-
-    def reset_camera(self):
-        self.close()
-        return self
-
-    def update_settings(self, settings: Settings):
-        """Resolution is dictated by the RTSP source, so this is a no-op."""
-        return self
+def _encode_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
+    """Encode a frame as JPEG bytes at the given quality."""
+    return cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])[1].tobytes()
 
 
 class _DependencyInjector:
@@ -417,6 +109,7 @@ class _DetectorInjector:
     def __init__(self):
         self._detector: ObjectDetector | None = None
         self._lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     def __call__(self) -> ObjectDetector:
         if self._detector is None:
@@ -424,6 +117,16 @@ class _DetectorInjector:
                 if self._detector is None:
                     self._detector = ObjectDetector()
         return self._detector
+
+    def detect(self, frame: np.ndarray) -> np.ndarray:
+        """Annotate a frame, serialising access to the single Hailo device.
+
+        Concurrent streams and requests all share one accelerator, so inference
+        is funnelled through a lock rather than interleaved on it.
+        """
+        detector = self()
+        with self._infer_lock:
+            return detector.detect(frame)
 
 
 detector_injector = _DetectorInjector()
@@ -436,7 +139,7 @@ def _build_camera_handler(source: str, url: str | None):
         if Picamera2 is None:
             raise RuntimeError("PiCamera2 is not available on this machine")
         return PiCameraHandler()
-    return RTSPCameraHandler(url or DEFAULT_RTSP_URL)
+    return RTSPCameraHandler(_resolve_rtsp_url(url))
 
 
 def _start_camera_internal(
@@ -500,25 +203,30 @@ def stop_camera(camera_handler: RTSPCameraHandler = Depends(camera_injector)):
 
 
 @camera_api.get("/capture")
-def capture_image(camera_handler: RTSPCameraHandler = Depends(camera_injector)):
+def capture_image(
+    width: int = 0,
+    quality: int = JPEG_QUALITY,
+    camera_handler: RTSPCameraHandler = Depends(camera_injector),
+):
+    """Return a single frame as JPEG, full resolution unless ``width`` is given."""
     if camera_handler is None:
         camera_handler = _start_camera_internal(None)
-    image = camera_handler.capture_image()
-    logging.info(f"Captured image of size {image.shape}")
-    return Response(content=cv2.imencode('.jpg', image)[1].tobytes(), media_type="image/jpeg")
+    image = _scale_to_width(camera_handler.capture_image(), width)
+    return Response(content=_encode_jpeg(image, quality), media_type="image/jpeg")
 
 
 @camera_api.get("/detect")
 def detect_objects(
+    width: int = 0,
+    quality: int = JPEG_QUALITY,
     camera_handler: RTSPCameraHandler = Depends(camera_injector),
-    detector: ObjectDetector = Depends(detector_injector),
 ):
     """Capture the current frame and return it annotated with detected objects."""
     if camera_handler is None:
         camera_handler = _start_camera_internal(None)
-    frame = camera_handler.capture_image()
-    annotated = detector.detect(frame)
-    return Response(content=cv2.imencode('.jpg', annotated)[1].tobytes(), media_type="image/jpeg")
+    frame = _scale_to_width(camera_handler.capture_image(), width)
+    annotated = detector_injector.detect(frame)
+    return Response(content=_encode_jpeg(annotated, quality), media_type="image/jpeg")
 
 
 @camera_api.get("/restart")
@@ -551,39 +259,62 @@ def update_settings(settings: Settings, camera_handler: RTSPCameraHandler = Depe
 
 
 @camera_api.get("/stream")
-async def stream_video(camera_handler: RTSPCameraHandler | None = Depends(camera_injector)):
-    """Stream live video as MJPEG"""
+async def stream_video(
+    detect: bool = False,
+    width: int = STREAM_WIDTH,
+    quality: int = STREAM_QUALITY,
+    max_fps: float = STREAM_MAX_FPS,
+    camera_handler: RTSPCameraHandler | None = Depends(camera_injector),
+):
+    """Stream live video as MJPEG, optionally annotated with detections.
+
+    The browser consumes this directly through an ``<img>`` tag, so frames travel
+    over plain HTTP and back-pressure is handled by TCP: a slow client simply
+    receives fewer frames. Pushing frames to the page over the websocket instead
+    lets a slow client build an unbounded queue, and latency grows without bound.
+    """
     if camera_handler is None:
         camera_handler = _start_camera_internal(None)
 
     camera_handler.streaming_active = True
+    min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
+
+    def _render(last_seq: int) -> tuple[bytes, int]:
+        """Blocking part of the pipeline; runs off the event loop."""
+        frame, seq = camera_handler.next_frame(last_seq, timeout=5.0)
+        # Downscale before inference and drawing so every later stage works on
+        # the smaller frame the browser is actually going to display.
+        frame = _scale_to_width(frame, width)
+        if detect:
+            frame = detector_injector.detect(frame)
+        return _encode_jpeg(frame, quality), seq
 
     async def generate_frames():
+        last_seq = 0
         try:
             while camera_handler.streaming_active:
+                started = time.monotonic()
                 try:
-                    # Capture frame from camera
-                    frame = camera_handler.capture_image()
-
-                    # Encode frame as JPEG
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    frame_bytes = buffer.tobytes()
-
-                    # Yield frame in multipart format
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-                    # Small delay to control frame rate
-                    await asyncio.sleep(0.033)  # ~30 fps
+                    payload, last_seq = await asyncio.to_thread(_render, last_seq)
+                except TimeoutError:
+                    continue  # Source stalled; hold the connection open and retry.
                 except Exception as e:
                     logging.error(f"Error generating frame: {e}")
                     break
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(payload)).encode() + b'\r\n\r\n'
+                       + payload + b'\r\n')
+                remaining = min_interval - (time.monotonic() - started)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
         finally:
-            camera_handler.streaming_active = False
             logging.info("Streaming stopped")
+
     return StreamingResponse(
         generate_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
     )
 
 
@@ -633,4 +364,16 @@ def stop_recording(camera_handler: RTSPCameraHandler = Depends(camera_injector))
         return {"message": "Not recording"}
     except Exception as e:
         logging.error(f"Error stopping recording: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@camera_api.get("/start_gatekeeper")
+def start_gatekeeper(camera_handler: RTSPCameraHandler = Depends(camera_injector)):
+    """Start the gatekeeper"""
+    if camera_handler is None:
+        return JSONResponse(status_code=400, content={"message": "Camera not started"})
+    try:
+        camera_handler.start_gatekeeper()
+        return {"message": "Gatekeeper started"}
+    except Exception as e:
+        logging.error(f"Error starting gatekeeper: {e}")
         return JSONResponse(status_code=500, content={"message": str(e)})

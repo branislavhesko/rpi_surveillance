@@ -21,7 +21,9 @@ logging.basicConfig(
 
 from nicegui import app, ui
 
-from rpi_surveillance.backend.server import API_PREFIX, RECORDINGS_DIR, camera_api
+from rpi_surveillance.config import get_storage_secret
+from rpi_surveillance.backend.camera import RECORDINGS_DIR
+from rpi_surveillance.backend.server import API_PREFIX, camera_api
 from rpi_surveillance.ui.live_view import create_live_view_page
 from rpi_surveillance.ui.login import logout, setup_auth_middleware
 from rpi_surveillance.ui.record_viewer import create_record_viewer_page
@@ -129,7 +131,7 @@ html, body { background: var(--bg-page) !important; }
     background: #000;
     border-radius: 10px;
     overflow: hidden;
-    aspect-ratio: 4/3;
+    aspect-ratio: 16/9;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -302,7 +304,7 @@ def main_menu() -> None:
 def run_app() -> None:
     """Run the combined NiceGUI + FastAPI application on a single port."""
     ui.run(
-        storage_secret='FAIRYTALE',  # TODO: change in production
+        storage_secret=get_storage_secret(),  # loaded from STORAGE_SECRET in .env
         port=PORT,
         host=HOST,
         title='RPI Surveillance',

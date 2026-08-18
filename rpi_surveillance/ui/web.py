@@ -104,7 +104,7 @@ html, body { background: var(--bg-page) !important; }
     background: #000;
     border-radius: 10px;
     overflow: hidden;
-    aspect-ratio: 4/3;
+    aspect-ratio: 16/9;
     display: flex;
     align-items: center;
     justify-content: center;

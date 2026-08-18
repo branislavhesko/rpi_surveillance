@@ -3,20 +3,30 @@
 from typing import Optional
 
 from fastapi import Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from nicegui import app, ui
 
+from rpi_surveillance.config import get_users
 
-# Dummy credentials – replace with proper hashing in production
-PASSWORDS = {'user1': 'pass1', 'user2': 'pass2', 'admin': 'admin'}
+
+# Login credentials, loaded from APP_USERS in .env (see config.get_users).
+PASSWORDS = get_users()
 
 UNRESTRICTED_PAGE_ROUTES = {'/login'}
 
-# Path prefixes that bypass authentication entirely. The camera REST API
-# (mounted under /api) is called server-side without a browser session cookie,
-# so it must not be redirected to the login page.
-UNRESTRICTED_PATH_PREFIXES = ('/_nicegui', '/api', '/media')
+# Path prefixes that bypass the login redirect. NiceGUI internals and media
+# files are needed by the authenticated browser session.
+UNRESTRICTED_PATH_PREFIXES = ('/_nicegui', '/media')
+
+# Camera control endpoints are called server-side from localhost, so they stay
+# restricted to loopback rather than being exposed to the network.
+API_PATH_PREFIX = '/api'
+LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost'})
+
+# The live view's <img> pulls MJPEG frames from the browser itself, so this one
+# endpoint has to be reachable over the network — gated on a logged-in session.
+STREAM_PATH = f'{API_PATH_PREFIX}/stream'
 
 LOGIN_CSS = """
 html, body {
@@ -58,6 +68,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+        # Camera API: loopback only, except the live stream an authenticated
+        # browser needs to fetch directly.
+        if path.startswith(API_PATH_PREFIX):
+            client_host = request.client.host if request.client else None
+            if client_host in LOOPBACK_HOSTS:
+                return await call_next(request)
+            if path == STREAM_PATH and app.storage.user.get('authenticated', False):
+                return await call_next(request)
+            return JSONResponse(status_code=403, content={'message': 'Forbidden'})
         if (path.startswith(UNRESTRICTED_PATH_PREFIXES)
                 or path in UNRESTRICTED_PAGE_ROUTES):
             return await call_next(request)

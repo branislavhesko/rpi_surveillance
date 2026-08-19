@@ -10,7 +10,6 @@ server of its own.
 import asyncio
 import logging
 import os
-import threading
 import time
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -25,7 +24,6 @@ except Exception:  # pragma: no cover - only present on a Raspberry Pi
     Picamera2 = None
 
 
-
 from rpi_surveillance.backend.camera import (
     DEFAULT_RTSP_URL,
     JPEG_QUALITY,
@@ -33,7 +31,7 @@ from rpi_surveillance.backend.camera import (
     PiCameraHandler,
     Settings,
 )
-from rpi_surveillance.backend.inference.detector import ObjectDetector
+from rpi_surveillance.backend.inference.detector_injector import detector_injector
 from rpi_surveillance.config import load_env
 
 logger = logging.getLogger(__name__)
@@ -101,35 +99,6 @@ class _DependencyInjector:
 
 
 camera_injector = _DependencyInjector()
-
-
-class _DetectorInjector:
-    """Lazily builds the ObjectDetector on first use (loads the Hailo model)."""
-
-    def __init__(self):
-        self._detector: ObjectDetector | None = None
-        self._lock = threading.Lock()
-        self._infer_lock = threading.Lock()
-
-    def __call__(self) -> ObjectDetector:
-        if self._detector is None:
-            with self._lock:
-                if self._detector is None:
-                    self._detector = ObjectDetector()
-        return self._detector
-
-    def detect(self, frame: np.ndarray) -> np.ndarray:
-        """Annotate a frame, serialising access to the single Hailo device.
-
-        Concurrent streams and requests all share one accelerator, so inference
-        is funnelled through a lock rather than interleaved on it.
-        """
-        detector = self()
-        with self._infer_lock:
-            return detector.detect(frame)
-
-
-detector_injector = _DetectorInjector()
 
 
 def _build_camera_handler(source: str, url: str | None):

@@ -165,6 +165,13 @@ class PiCameraHandler:
         self._recording_thread.start()
         self.logger.info(f"Started recording to {self._recording_path}")
         return self._recording_path
+    
+    def start_gatekeeper(self):
+        self.logger.info("Starting gatekeeper")
+        self._gatekeeper_thread = threading.Thread(target=self._gatekeeper_loop, daemon=True)
+        self._gatekeeper_thread.start()
+        return self
+            
 
     def _record_loop(self):
         """Background thread: capture frames and pipe to ffmpeg."""

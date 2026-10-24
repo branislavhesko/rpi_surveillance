@@ -8,8 +8,10 @@ dependencies = [
     "uvicorn",
     "pydantic",
     "nicegui",
+    "loguru",
     "numpy",
     "opencv-python-headless",
+    "pyyaml",
     # Add your other dependencies here
 ]
 

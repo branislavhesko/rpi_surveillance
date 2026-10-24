@@ -49,9 +49,9 @@ TELEGRAM_CHAT_ID=123456789          # comma-separated for several chats
 GATEKEEPER_CLASSES=human,animal     # groups "human"/"animal" or any COCO label, e.g. car
 GATEKEEPER_MIN_SCORE=0.5
 GATEKEEPER_FPS=2                    # detection rate
-GATEKEEPER_HOLD_SECONDS=10          # keep recording this long after the last detection
-GATEKEEPER_MAX_RECORDING_SECONDS=300
-GATEKEEPER_NOTIFY_COOLDOWN_SECONDS=60
+GATEKEEPER_HOLD_SECONDS=5           # keep recording this long after the last detection
+GATEKEEPER_MAX_RECORDING_SECONDS=60  # longer events continue in a new clip
+GATEKEEPER_NOTIFY_COOLDOWN_SECONDS=30  # min gap between Telegram alerts
 GATEKEEPER_SNAPSHOT_DELAY_SECONDS=3   # alert snapshot = middle frame of this window
 ```
 

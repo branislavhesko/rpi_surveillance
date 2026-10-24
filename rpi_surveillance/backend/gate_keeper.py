@@ -54,6 +54,13 @@ CLASS_GROUPS: dict[str, frozenset[str]] = {
 }
 
 DEFAULT_CLASSES = "human,animal"
+# Stop recording once nothing watched has been seen for this long.
+DEFAULT_HOLD_SECONDS = 5.0
+# Cap a single clip; a still-present object continues in a new clip.
+DEFAULT_MAX_RECORDING_SECONDS = 60.0
+# Minimum gap between Telegram alerts.
+DEFAULT_NOTIFY_COOLDOWN_SECONDS = 30.0
+DEFAULT_SNAPSHOT_DELAY_SECONDS = 3.0
 
 
 def resolve_classes(spec: str) -> frozenset[str]:
@@ -84,10 +91,10 @@ class GateKeeperConfig:
     )
     min_score: float = 0.5
     fps: float = 2.0
-    hold_seconds: float = 10.0
-    max_recording_seconds: float = 300.0
-    notify_cooldown_seconds: float = 60.0
-    snapshot_delay_seconds: float = 3.0
+    hold_seconds: float = DEFAULT_HOLD_SECONDS
+    max_recording_seconds: float = DEFAULT_MAX_RECORDING_SECONDS
+    notify_cooldown_seconds: float = DEFAULT_NOTIFY_COOLDOWN_SECONDS
+    snapshot_delay_seconds: float = DEFAULT_SNAPSHOT_DELAY_SECONDS
 
     @classmethod
     def from_env(cls) -> "GateKeeperConfig":

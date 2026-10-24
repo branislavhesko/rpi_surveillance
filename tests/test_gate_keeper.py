@@ -226,4 +226,6 @@ def test_config_from_env(monkeypatch):
     assert cfg.snapshot_delay_seconds == 5.0
     assert cfg.classes == ANIMAL_LABELS
     assert cfg.min_score == 0.7
-    assert cfg.hold_seconds == 10.0
+    assert cfg.hold_seconds == 5.0
+    assert cfg.max_recording_seconds == 60.0
+    assert cfg.notify_cooldown_seconds == 30.0

@@ -41,11 +41,13 @@ class FakeCamera:
 class FakeDetector:
     def __init__(self):
         self.next = []
+        self.annotated = []
 
     def detect_objects(self, frame):
         return list(self.next)
 
     def annotate(self, frame, detections):
+        self.annotated.append(frame)
         return frame.copy()
 
 
@@ -89,7 +91,7 @@ def test_ignores_unwatched_and_low_score_objects():
 
 
 def test_detection_starts_recording_and_notifies_with_snapshot():
-    gk, camera, detector, notifier, _ = make()
+    gk, camera, detector, notifier, _ = make(snapshot_delay_seconds=0)
     detector.next = [det("person", 0.91), det("dog", 0.7)]
     gk.process_frame(FRAME)
     assert camera.recording and camera.started == 1
@@ -97,6 +99,35 @@ def test_detection_starts_recording_and_notifies_with_snapshot():
     text, image = notifier.sent[0]
     assert "person 91%" in text and "dog 70%" in text and "video_1.mp4" in text
     assert image[:2] == b"\xff\xd8"  # JPEG
+
+
+def test_alert_snapshot_is_middle_frame_after_delay():
+    gk, camera, detector, notifier, clock = make(snapshot_delay_seconds=3)
+    detector.next = [det("person")]
+    for t in range(4):
+        clock.t = t
+        gk.process_frame(np.full_like(FRAME, t * 10))
+        if t < 3:
+            assert camera.recording and notifier.sent == []
+    assert len(notifier.sent) == 1
+    assert detector.annotated[-1][0, 0, 0] == 20
+    assert "video_1.mp4" in notifier.sent[0][0]
+
+
+def test_alert_sent_when_event_ends_before_delay():
+    gk, camera, detector, notifier, clock = make(
+        snapshot_delay_seconds=30, hold_seconds=2
+    )
+    detector.next = [det("dog")]
+    for t in range(3):
+        clock.t = t
+        gk.process_frame(np.full_like(FRAME, t * 10))
+    detector.next = []
+    clock.t = 5
+    gk.process_frame(FRAME)
+    assert not camera.recording
+    assert len(notifier.sent) == 1
+    assert detector.annotated[-1][0, 0, 0] == 10
 
 
 def test_recording_continues_while_seen_and_stops_after_hold():
@@ -117,7 +148,7 @@ def test_recording_continues_while_seen_and_stops_after_hold():
 
 def test_notification_cooldown_between_events():
     gk, camera, detector, notifier, clock = make(
-        hold_seconds=1, notify_cooldown_seconds=60
+        hold_seconds=1, notify_cooldown_seconds=60, snapshot_delay_seconds=0
     )
     for t, seen in [(0, True), (2, False), (10, True), (12, False), (70, True)]:
         clock.t = t
@@ -190,7 +221,9 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("GATEKEEPER_CLASSES", "animal")
     monkeypatch.setenv("GATEKEEPER_MIN_SCORE", "0.7")
     monkeypatch.setenv("GATEKEEPER_HOLD_SECONDS", "oops")
+    monkeypatch.setenv("GATEKEEPER_SNAPSHOT_DELAY_SECONDS", "5")
     cfg = GateKeeperConfig.from_env()
+    assert cfg.snapshot_delay_seconds == 5.0
     assert cfg.classes == ANIMAL_LABELS
     assert cfg.min_score == 0.7
     assert cfg.hold_seconds == 10.0

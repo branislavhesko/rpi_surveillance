@@ -2,8 +2,11 @@
 
 A background thread samples frames at a low rate and runs object detection.
 When an object of a watched class appears, recording starts and a Telegram
-alert with an annotated snapshot is sent. Recording stops once nothing watched
-has been seen for ``hold_seconds`` (or ``max_recording_seconds`` is reached).
+alert is sent. The alert's snapshot is the middle frame of the first
+``snapshot_delay_seconds`` of the event rather than the very first detection,
+which usually catches the object only at the edge of the frame. Recording
+stops once nothing watched has been seen for ``hold_seconds`` (or
+``max_recording_seconds`` is reached).
 """
 
 import logging
@@ -84,6 +87,7 @@ class GateKeeperConfig:
     hold_seconds: float = 10.0
     max_recording_seconds: float = 300.0
     notify_cooldown_seconds: float = 60.0
+    snapshot_delay_seconds: float = 3.0
 
     @classmethod
     def from_env(cls) -> "GateKeeperConfig":
@@ -100,6 +104,9 @@ class GateKeeperConfig:
             ),
             notify_cooldown_seconds=_env_float(
                 "GATEKEEPER_NOTIFY_COOLDOWN_SECONDS", cls.notify_cooldown_seconds
+            ),
+            snapshot_delay_seconds=_env_float(
+                "GATEKEEPER_SNAPSHOT_DELAY_SECONDS", cls.snapshot_delay_seconds
             ),
         )
 
@@ -140,6 +147,25 @@ def _summarize(detections: list[Detection]) -> str:
     )
 
 
+# Upper bound on frames buffered for the alert snapshot; halved when reached.
+_MAX_ALERT_FRAMES = 64
+
+
+@dataclass
+class _PendingAlert:
+    """Frames collected after a trigger, until the snapshot is picked."""
+
+    started: float
+    when: datetime
+    recording: str | None
+    frames: list[tuple[np.ndarray, list[Detection]]]
+
+    def add(self, frame: np.ndarray, matches: list[Detection]) -> None:
+        self.frames.append((frame.copy(), matches))
+        if len(self.frames) >= _MAX_ALERT_FRAMES:
+            self.frames = self.frames[::2]
+
+
 class GateKeeper:
     def __init__(
         self,
@@ -161,6 +187,7 @@ class GateKeeper:
         self._event_started: float | None = None
         self._last_seen: float | None = None
         self._last_notified: float | None = None
+        self._pending_alert: _PendingAlert | None = None
         self._owns_recording = False
         self._recording_path: str | None = None
         self._last_labels = ""
@@ -239,6 +266,14 @@ class GateKeeper:
                 self._last_labels = _summarize(matches)
                 if not self.event_active:
                     self._begin_event(frame, matches, now)
+                elif self._pending_alert is not None:
+                    self._pending_alert.add(frame, matches)
+            pending = self._pending_alert
+            if (
+                pending is not None
+                and now - pending.started >= self.config.snapshot_delay_seconds
+            ):
+                self._send_alert()
             if self.event_active:
                 idle = now - self._last_seen
                 duration = now - self._event_started
@@ -256,8 +291,7 @@ class GateKeeper:
     ) -> None:
         self.events += 1
         self._event_started = now
-        summary = _summarize(matches)
-        logger.info(f"Gatekeeper triggered: {summary}")
+        logger.info(f"Gatekeeper triggered: {_summarize(matches)}")
 
         # Never hijack a recording someone started by hand: only stop what we start.
         if not self.camera.recording:
@@ -267,9 +301,10 @@ class GateKeeper:
             except Exception as e:
                 logger.error(f"Gatekeeper could not start recording: {e}")
 
-        self._notify(frame, matches, summary, now)
+        self._queue_alert(frame, matches, now)
 
     def _end_event(self) -> None:
+        self._send_alert()
         if self._owns_recording:
             try:
                 path = self.camera.stop_recording()
@@ -280,8 +315,8 @@ class GateKeeper:
         self._recording_path = None
         self._event_started = None
 
-    def _notify(
-        self, frame: np.ndarray, matches: list[Detection], summary: str, now: float
+    def _queue_alert(
+        self, frame: np.ndarray, matches: list[Detection], now: float
     ) -> None:
         if self.notifier is None:
             return
@@ -289,10 +324,24 @@ class GateKeeper:
         if self._last_notified is not None and now - self._last_notified < cooldown:
             return
         self._last_notified = now
+        self._pending_alert = _PendingAlert(
+            started=now,
+            when=datetime.now(),
+            recording=self._recording_path,
+            frames=[],
+        )
+        self._pending_alert.add(frame, matches)
 
-        text = f"Gatekeeper: detected {summary} at {datetime.now():%Y-%m-%d %H:%M:%S}"
-        if self._recording_path:
-            text += f"\nRecording: {Path(self._recording_path).name}"
+    def _send_alert(self) -> None:
+        """Send the queued alert, using the middle collected frame as snapshot."""
+        pending, self._pending_alert = self._pending_alert, None
+        if pending is None or self.notifier is None:
+            return
+        summary = _summarize([d for _, dets in pending.frames for d in dets])
+        text = f"Gatekeeper: detected {summary} at {pending.when:%Y-%m-%d %H:%M:%S}"
+        if pending.recording:
+            text += f"\nRecording: {Path(pending.recording).name}"
+        frame, matches = pending.frames[len(pending.frames) // 2]
         image = None
         try:
             annotated = self.detector.annotate(frame, matches)

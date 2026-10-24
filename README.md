@@ -30,10 +30,12 @@ pip install rpi-libcamera rpi-kms picamera2
 
 The gatekeeper watches the running camera, and when a person or an animal is
 detected it starts recording (saved to the recordings directory) and sends a
-Telegram alert with an annotated snapshot. Recording stops once nothing has
-been seen for `GATEKEEPER_HOLD_SECONDS`. Arm it with the **Gatekeeper** button on the **Live** tab (this also turns on AI
-detection in the live view), or via
-`/api/gatekeeper/start`, `/api/gatekeeper/stop` and `/api/gatekeeper/status`.
+Telegram alert with an annotated snapshot. The snapshot is the middle frame of
+the first `GATEKEEPER_SNAPSHOT_DELAY_SECONDS` of the event, so the object is
+well in view rather than just entering the frame. Recording stops once nothing
+has been seen for `GATEKEEPER_HOLD_SECONDS`. Arm it with the **Gatekeeper**
+button on the **Live** tab (this also turns on AI detection in the live view),
+or via `/api/gatekeeper/start`, `/api/gatekeeper/stop` and `/api/gatekeeper/status`.
 
 Configure it in `.env`:
 
@@ -50,6 +52,7 @@ GATEKEEPER_FPS=2                    # detection rate
 GATEKEEPER_HOLD_SECONDS=10          # keep recording this long after the last detection
 GATEKEEPER_MAX_RECORDING_SECONDS=300
 GATEKEEPER_NOTIFY_COOLDOWN_SECONDS=60
+GATEKEEPER_SNAPSHOT_DELAY_SECONDS=3   # alert snapshot = middle frame of this window
 ```
 
 Without Telegram credentials the gatekeeper still records, it just doesn't alert.

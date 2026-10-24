@@ -210,6 +210,14 @@ def create_live_view_page() -> None:
             detection_radio = ui.radio(['Off', 'On'], value='Off').props(
                 'inline dense color=teal disable').classes('q-ml-sm')
 
+        # ── Gatekeeper toggle ─────────────────────────────────────────────
+        with ui.row().classes('items-center').style('gap:8px'):
+            ui.icon('shield').style('color:var(--accent); font-size:1.15rem')
+            ui.label('Gatekeeper').classes('text-caption').style('color:var(--text-2); font-weight:500')
+            gatekeeper_radio = ui.radio(['Off', 'On'], value='Off').props(
+                'inline dense color=teal disable').classes('q-ml-sm')
+            gatekeeper_label = ui.label('').classes('text-caption').style('color:var(--text-3)')
+
         # ── State ─────────────────────────────────────────────────────────
         is_recording = False
 
@@ -287,6 +295,7 @@ def create_live_view_page() -> None:
                     for btn in (stop_btn, capture_btn, record_btn):
                         btn.props(remove='disable')
                     detection_radio.props(remove='disable')
+                    gatekeeper_radio.props(remove='disable')
                     _set_source_locked(True)
                     ui.notify('Camera started', color='positive', icon='check_circle', position='top-right')
                 else:
@@ -331,6 +340,9 @@ def create_live_view_page() -> None:
                         btn.props('disable')
                     detection_radio.set_value('Off')
                     detection_radio.props('disable')
+                    _set_gatekeeper_radio('Off')
+                    gatekeeper_radio.props('disable')
+                    gatekeeper_label.set_text('')
                     _set_source_locked(False)
                     ui.notify('Camera stopped', color='info', icon='info', position='top-right')
                 else:
@@ -381,6 +393,59 @@ def create_live_view_page() -> None:
                         ui.notify(f'Failed: {resp.text}', color='negative', position='top-right')
                 except Exception as exc:
                     ui.notify(f'Connection error: {exc}', color='negative', position='top-right')
+
+        _gatekeeper_syncing = False
+
+        def _set_gatekeeper_radio(value: str) -> None:
+            """Change the toggle without re-triggering its change handler."""
+            nonlocal _gatekeeper_syncing
+            _gatekeeper_syncing = True
+            gatekeeper_radio.set_value(value)
+            _gatekeeper_syncing = False
+
+        async def toggle_gatekeeper(e) -> None:
+            if _gatekeeper_syncing:
+                return
+            enable = e.value == 'On'
+            try:
+                resp = await _request('GET', '/gatekeeper/start' if enable else '/gatekeeper/stop',
+                                      timeout=20)
+                if resp.status_code != 200:
+                    raise RuntimeError(resp.text)
+                if enable:
+                    data = resp.json()
+                    if not data.get('notifications'):
+                        ui.notify('Gatekeeper armed — Telegram not configured, recording only',
+                                  color='warning', icon='warning', position='top-right')
+                    else:
+                        ui.notify('Gatekeeper armed', color='positive', icon='shield',
+                                  position='top-right')
+                else:
+                    ui.notify('Gatekeeper disarmed', color='info', icon='info', position='top-right')
+                await refresh_gatekeeper_status()
+            except Exception as exc:
+                _set_gatekeeper_radio('Off' if enable else 'On')
+                ui.notify(f'Gatekeeper error: {exc}', color='negative', position='top-right')
+
+        async def refresh_gatekeeper_status() -> None:
+            if gatekeeper_radio.value != 'On':
+                gatekeeper_label.set_text('')
+                return
+            try:
+                data = (await _request('GET', '/gatekeeper/status', timeout=3)).json()
+            except Exception:
+                return
+            if not data.get('running'):
+                gatekeeper_label.set_text('stopped')
+            elif data.get('last_error'):
+                gatekeeper_label.set_text(f"error: {data['last_error']}")
+            elif data.get('event_active'):
+                gatekeeper_label.set_text(f"● triggered: {data.get('last_detection') or ''}")
+            else:
+                gatekeeper_label.set_text(f"armed · {data.get('events', 0)} events")
+
+        gatekeeper_radio.on_value_change(toggle_gatekeeper)
+        ui.timer(3.0, refresh_gatekeeper_status)
 
         # ── Wire up buttons ───────────────────────────────────────────────
         start_btn.on_click(start_camera)

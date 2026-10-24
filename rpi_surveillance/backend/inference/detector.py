@@ -28,6 +28,7 @@ from hailo_apps.python.core.common.hailo_inference import HailoInfer
 from hailo_apps.python.core.common.toolbox import get_labels, load_json_file, default_preprocess
 from hailo_apps.python.core.common.core import resolve_hef_path
 
+from rpi_surveillance.backend.inference.detection import Detection
 from rpi_surveillance.backend.inference.object_detection_postprocess import (
     extract_detections,
     draw_detections,
@@ -109,6 +110,31 @@ class ObjectDetector:
         """Run detection on one BGR frame and return it annotated with boxes and labels."""
         detections = self._infer(frame_bgr)
         return draw_detections(detections, frame_bgr.copy(), self.labels)
+
+    def detect_objects(self, frame_bgr: np.ndarray) -> list[Detection]:
+        """Run detection on one BGR frame and return the detected objects."""
+        raw = self._infer(frame_bgr)
+        return [
+            Detection(
+                class_id=int(class_id),
+                label=self.labels[class_id] if 0 <= class_id < len(self.labels) else str(class_id),
+                score=float(score),
+                box=tuple(int(v) for v in box),
+            )
+            for box, class_id, score in zip(
+                raw["detection_boxes"], raw["detection_classes"], raw["detection_scores"]
+            )
+        ]
+
+    def annotate(self, frame_bgr: np.ndarray, detections: list[Detection]) -> np.ndarray:
+        """Return a copy of ``frame_bgr`` with ``detections`` drawn on it."""
+        raw = {
+            "detection_boxes": [list(d.box) for d in detections],
+            "detection_classes": [d.class_id for d in detections],
+            "detection_scores": [d.score for d in detections],
+            "num_detections": len(detections),
+        }
+        return draw_detections(raw, frame_bgr.copy(), self.labels)
 
     def _infer(self, frame_bgr: np.ndarray) -> dict:
         model_input = frame_to_model_input(frame_bgr, self.model.input_width, self.model.input_height)

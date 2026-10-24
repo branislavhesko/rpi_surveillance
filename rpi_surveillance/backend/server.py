@@ -33,7 +33,9 @@ from rpi_surveillance.backend.camera import (
     PiCameraHandler,
     Settings,
 )
-from rpi_surveillance.backend.inference.detector import ObjectDetector
+from rpi_surveillance.backend.gate_keeper import GateKeeper, GateKeeperConfig
+from rpi_surveillance.backend.inference.detector_injector import detector_injector
+from rpi_surveillance.backend.telegram_notifier import TelegramNotifier
 from rpi_surveillance.config import load_env
 
 logger = logging.getLogger(__name__)
@@ -103,33 +105,41 @@ class _DependencyInjector:
 camera_injector = _DependencyInjector()
 
 
-class _DetectorInjector:
-    """Lazily builds the ObjectDetector on first use (loads the Hailo model)."""
+class _GateKeeperInjector:
+    """Holds the single running GateKeeper, if any."""
 
     def __init__(self):
-        self._detector: ObjectDetector | None = None
+        self.gatekeeper: GateKeeper | None = None
         self._lock = threading.Lock()
-        self._infer_lock = threading.Lock()
 
-    def __call__(self) -> ObjectDetector:
-        if self._detector is None:
-            with self._lock:
-                if self._detector is None:
-                    self._detector = ObjectDetector()
-        return self._detector
+    def start(self, camera_handler) -> GateKeeper:
+        with self._lock:
+            if self.gatekeeper is not None and self.gatekeeper.running:
+                if self.gatekeeper.camera is camera_handler:
+                    return self.gatekeeper
+                self.gatekeeper.stop()
+            if self.gatekeeper is not None and self.gatekeeper.notifier is not None:
+                self.gatekeeper.notifier.close()
+            self.gatekeeper = GateKeeper(
+                camera_handler,
+                detector_injector,
+                notifier=TelegramNotifier.from_env(),
+                config=GateKeeperConfig.from_env(),
+            ).start()
+            return self.gatekeeper
 
-    def detect(self, frame: np.ndarray) -> np.ndarray:
-        """Annotate a frame, serialising access to the single Hailo device.
+    def stop(self) -> None:
+        with self._lock:
+            if self.gatekeeper is not None:
+                self.gatekeeper.stop()
 
-        Concurrent streams and requests all share one accelerator, so inference
-        is funnelled through a lock rather than interleaved on it.
-        """
-        detector = self()
-        with self._infer_lock:
-            return detector.detect(frame)
+    def status(self) -> dict:
+        if self.gatekeeper is None:
+            return {"running": False}
+        return self.gatekeeper.status()
 
 
-detector_injector = _DetectorInjector()
+gatekeeper_injector = _GateKeeperInjector()
 
 
 def _build_camera_handler(source: str, url: str | None):
@@ -147,6 +157,7 @@ def _start_camera_internal(
     url: str | None = None,
     source: str = "rtsp",
 ):
+    gatekeeper_injector.stop()
     if _camera_handler is not None:
         logging.info("Cleaning up existing camera handler")
         try:
@@ -196,6 +207,7 @@ def start_camera(
 
 @camera_api.get("/stop")
 def stop_camera(camera_handler: RTSPCameraHandler = Depends(camera_injector)):
+    gatekeeper_injector.stop()
     if camera_handler is not None:
         camera_handler.reset_camera()
         camera_injector.set_camera_handler(None)
@@ -242,6 +254,7 @@ def restart_camera(camera_handler: RTSPCameraHandler = Depends(camera_injector))
         # If restart fails, try full reinitialize
         logging.error(f"Simple restart failed: {e}. Attempting full reinitialization.")
         try:
+            gatekeeper_injector.stop()
             camera_handler.close()
             camera_handler = RTSPCameraHandler().start()
             camera_injector.set_camera_handler(camera_handler)
@@ -366,14 +379,26 @@ def stop_recording(camera_handler: RTSPCameraHandler = Depends(camera_injector))
         logging.error(f"Error stopping recording: {e}")
         return JSONResponse(status_code=500, content={"message": str(e)})
 
-@camera_api.get("/start_gatekeeper")
+@camera_api.get("/gatekeeper/start")
 def start_gatekeeper(camera_handler: RTSPCameraHandler = Depends(camera_injector)):
-    """Start the gatekeeper"""
+    """Watch the camera; record and alert on Telegram when a watched object appears."""
     if camera_handler is None:
         return JSONResponse(status_code=400, content={"message": "Camera not started"})
     try:
-        camera_handler.start_gatekeeper()
-        return {"message": "Gatekeeper started"}
+        gatekeeper = gatekeeper_injector.start(camera_handler)
+        return {"message": "Gatekeeper started", **gatekeeper.status()}
     except Exception as e:
         logging.error(f"Error starting gatekeeper: {e}")
         return JSONResponse(status_code=500, content={"message": str(e)})
+
+
+@camera_api.get("/gatekeeper/stop")
+def stop_gatekeeper():
+    """Stop the gatekeeper, finalising any recording it started."""
+    gatekeeper_injector.stop()
+    return {"message": "Gatekeeper stopped"}
+
+
+@camera_api.get("/gatekeeper/status")
+def gatekeeper_status():
+    return gatekeeper_injector.status()

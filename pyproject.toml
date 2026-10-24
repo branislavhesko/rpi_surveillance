@@ -10,6 +10,7 @@ dependencies = [
     "nicegui",
     "numpy",
     "opencv-python-headless",
+    "requests",
     # Add your other dependencies here
 ]
 

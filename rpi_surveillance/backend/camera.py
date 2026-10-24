@@ -142,6 +142,10 @@ class PiCameraHandler:
         self.logger.info(f"Saved image to {filename}")
         return filename
 
+    @property
+    def recording(self) -> bool:
+        return self._recording
+
     def start_recording(self) -> str:
         """Start recording video to an MP4 file (H.264 via ffmpeg)."""
         if self._recording:
@@ -360,6 +364,10 @@ class RTSPCameraHandler:
         cv2.imwrite(filename, frame, JPEG_ENCODE_PARAMS)
         self.logger.info(f"Saved image to {filename}")
         return filename
+
+    @property
+    def recording(self) -> bool:
+        return self._recording
 
     def start_recording(self) -> str:
         """Start recording video to an MP4 file (H.264 via ffmpeg)."""

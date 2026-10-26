@@ -96,6 +96,12 @@ html, body { background: var(--bg-page) !important; }
     align-items: center;
 }
 .ctrl-row .q-btn { min-height: 40px; border-radius: 8px !important; }
+.ctrl-row .q-btn.gatekeeper-armed { animation: pulse-teal 2s infinite; font-weight: 600; }
+@keyframes pulse-teal {
+    0%   { box-shadow: 0 0 0 0   rgba(20,184,166,.7); }
+    70%  { box-shadow: 0 0 0 8px rgba(20,184,166,0);  }
+    100% { box-shadow: 0 0 0 0   rgba(20,184,166,0);  }
+}
 
 /* ── Camera frame ───────────────────────────────────────────────────────── */
 .cam-frame {

@@ -23,7 +23,13 @@ from nicegui import app, ui
 
 from rpi_surveillance.config import get_storage_secret
 from rpi_surveillance.backend.camera import RECORDINGS_DIR
-from rpi_surveillance.backend.server import API_PREFIX, camera_api
+from rpi_surveillance.backend.server import (
+    API_PREFIX,
+    camera_api,
+    camera_injector,
+    gatekeeper_injector,
+)
+from rpi_surveillance.backend.system_stats import SystemStats, get_system_stats
 from rpi_surveillance.ui.live_view import create_live_view_page
 from rpi_surveillance.ui.login import logout, setup_auth_middleware
 from rpi_surveillance.ui.record_viewer import create_record_viewer_page
@@ -92,6 +98,19 @@ html, body { background: var(--bg-page) !important; }
     transition    : border-color .15s;
 }
 .sv-card-raised:hover { border-color: var(--accent) !important; }
+.sv-clickable { cursor: pointer; user-select: none; }
+.sv-clickable:active { transform: scale(.98); }
+
+/* ── Header system metrics ─────────────────────────────────────────────── */
+.hdr-stat {
+    display: flex; align-items: center; gap: 3px;
+    padding: 2px 8px; border-radius: 6px;
+    color: var(--text-2); font-size: .75rem; font-variant-numeric: tabular-nums;
+}
+.hdr-stat:hover { background: var(--bg-raised); }
+.hdr-stat .q-icon { font-size: 1rem; color: var(--text-3); }
+.hdr-stat.warn, .hdr-stat.warn .q-icon { color: var(--warning); }
+.hdr-stat.crit, .hdr-stat.crit .q-icon { color: var(--danger); }
 
 /* ── Status dots ────────────────────────────────────────────────────────── */
 @keyframes pulse-green {
@@ -179,16 +198,78 @@ html, body { background: var(--bg-page) !important; }
 setup_auth_middleware()
 
 
-def _status_tile(label: str, icon: str, status: str, dot_cls: str) -> None:
-    with ui.card().classes('sv-card-raised').style('padding: 14px 16px; min-width: 130px; flex: 1'):
-        with ui.row().classes('items-center justify-between q-mb-xs'):
-            ui.icon(icon).style('color: var(--accent); font-size: 1.4rem')
-            ui.element('span').classes(f'sv-dot {dot_cls}')
-        ui.label(label).classes('text-caption').style('color: var(--text-3); font-weight:500')
-        ui.label(status).classes('text-body2 text-weight-bold').style('color: var(--text-1)')
+STATS_REFRESH_SECONDS = 2.0
+
+# (warn, critical) thresholds; the Pi starts throttling at 80 °C.
+TEMP_LIMITS = (70.0, 80.0)
+CPU_LIMITS = (85.0, 95.0)
+RAM_LIMITS = (85.0, 95.0)
+DISK_LIMITS = (90.0, 97.0)
 
 
-def _create_home_panel(username: str) -> None:
+def _level(value: float | None, limits: tuple[float, float]) -> str:
+    if value is None:
+        return 'unknown'
+    if value >= limits[1]:
+        return 'crit'
+    if value >= limits[0]:
+        return 'warn'
+    return 'ok'
+
+
+_DOT_FOR_LEVEL = {
+    'ok': 'sv-dot-online',
+    'warn': 'sv-dot-warn',
+    'crit': 'sv-dot-rec',
+    'unknown': 'sv-dot-offline',
+}
+
+
+def _fmt(value: float | None, fmt: str) -> str:
+    return 'n/a' if value is None else fmt.format(value)
+
+
+class _LiveStats:
+    """Polls system metrics once per tick and fans them out to UI updaters."""
+
+    def __init__(self) -> None:
+        self._updaters = []
+
+    def add(self, updater) -> None:
+        self._updaters.append(updater)
+
+    def refresh(self) -> None:
+        stats = get_system_stats(RECORDINGS_DIR)
+        for updater in self._updaters:
+            updater(stats)
+
+    def start(self) -> None:
+        self.refresh()
+        ui.timer(STATS_REFRESH_SECONDS, self.refresh)
+
+
+class _StatusTile:
+    def __init__(self, label: str, icon: str, on_click=None) -> None:
+        card = ui.card().classes('sv-card-raised').style(
+            'padding: 14px 16px; min-width: 130px; flex: 1')
+        if on_click is not None:
+            card.classes('sv-clickable').on('click', on_click)
+        with card:
+            with ui.row().classes('items-center justify-between q-mb-xs w-full'):
+                ui.icon(icon).style('color: var(--accent); font-size: 1.4rem')
+                self._dot = ui.element('span').classes('sv-dot sv-dot-offline')
+            ui.label(label).classes('text-caption').style('color: var(--text-3); font-weight:500')
+            self._value = ui.label('…').classes('text-body2 text-weight-bold').style(
+                'color: var(--text-1)')
+            self._detail = ui.label('').classes('text-caption').style('color: var(--text-3)')
+
+    def set(self, value: str, dot_cls: str, detail: str = '') -> None:
+        self._value.set_text(value)
+        self._dot.classes(replace=f'sv-dot {dot_cls}')
+        self._detail.set_text(detail or '\u00a0')  # keep tile heights even
+
+
+def _create_home_panel(username: str, live: _LiveStats, goto) -> None:
     with ui.column().classes('w-full q-pa-md').style('gap:20px; max-width:960px; margin:0 auto'):
 
         # Welcome banner
@@ -205,13 +286,74 @@ def _create_home_panel(username: str) -> None:
         # Status grid
         ui.label('System Status').classes('text-overline').style('color:var(--text-3); letter-spacing:1.5px')
         with ui.row().classes('w-full row wrap').style('gap:10px'):
-            _status_tile('Camera',       'videocam',   'Ready',   'sv-dot-online')
-            _status_tile('Storage',      'storage',    'OK',      'sv-dot-online')
-            _status_tile('AI Detection', 'psychology', 'Standby', 'sv-dot-warn')
-            _status_tile('Network',      'wifi',       'Online',  'sv-dot-online')
+            camera = _StatusTile('Camera', 'videocam', lambda: goto('live'))
+            storage = _StatusTile('Storage', 'storage', lambda: goto('recordings'))
+            detection = _StatusTile('AI Detection', 'psychology', lambda: goto('live'))
+            network = _StatusTile('Network', 'wifi', lambda: goto('settings'))
+
+        ui.label('Raspberry Pi').classes('text-overline').style('color:var(--text-3); letter-spacing:1.5px')
+        with ui.row().classes('w-full row wrap').style('gap:10px'):
+            temperature = _StatusTile('Temperature', 'thermostat', lambda: goto('settings'))
+            cpu = _StatusTile('CPU', 'memory', lambda: goto('settings'))
+            ram = _StatusTile('RAM', 'developer_board', lambda: goto('settings'))
+
+    network.set('Online', 'sv-dot-online')
+
+    def update(stats: SystemStats) -> None:
+        if camera_injector() is not None:
+            camera.set('Running', 'sv-dot-online')
+        else:
+            camera.set('Stopped', 'sv-dot-offline')
+
+        gk = gatekeeper_injector.status()
+        if gk.get('running'):
+            detection.set('Gatekeeper armed', 'sv-dot-online', f"{gk.get('events', 0)} events")
+        else:
+            detection.set('Standby', 'sv-dot-warn')
+
+        storage.set(_fmt(stats.disk_free_gb, '{:.1f} GB free'),
+                    _DOT_FOR_LEVEL[_level(stats.disk_percent, DISK_LIMITS)],
+                    _fmt(stats.disk_percent, '{:.0f}% used'))
+        temperature.set(_fmt(stats.temperature_c, '{:.1f} °C'),
+                        _DOT_FOR_LEVEL[_level(stats.temperature_c, TEMP_LIMITS)])
+        cpu.set(_fmt(stats.cpu_percent, '{:.0f}%'),
+                _DOT_FOR_LEVEL[_level(stats.cpu_percent, CPU_LIMITS)])
+        ram.set(_fmt(stats.ram_percent, '{:.0f}%'),
+                _DOT_FOR_LEVEL[_level(stats.ram_percent, RAM_LIMITS)],
+                '' if stats.ram_total_gb is None
+                else f'{stats.ram_used_gb:.1f} / {stats.ram_total_gb:.1f} GB')
+
+    live.add(update)
 
 
-def _create_settings_panel(username: str) -> None:
+def _create_header_stats(live: _LiveStats, goto) -> None:
+    """Compact temperature / CPU / RAM readout shown in the header on every tab."""
+    items = {}
+    with ui.row().classes('items-center no-wrap').style('gap:2px; margin-right:8px'):
+        for key, icon, tip in [('temp', 'thermostat', 'SoC temperature'),
+                               ('cpu', 'memory', 'CPU usage'),
+                               ('ram', 'developer_board', 'RAM usage')]:
+            with ui.element('div').classes('hdr-stat sv-clickable').on(
+                    'click', lambda: goto('home')) as chip:
+                ui.icon(icon)
+                items[key] = (chip, ui.label('…'))
+            chip.tooltip(tip)
+
+    def update(stats: SystemStats) -> None:
+        for key, value, fmt, limits in [
+            ('temp', stats.temperature_c, '{:.0f}°C', TEMP_LIMITS),
+            ('cpu', stats.cpu_percent, '{:.0f}%', CPU_LIMITS),
+            ('ram', stats.ram_percent, '{:.0f}%', RAM_LIMITS),
+        ]:
+            chip, label = items[key]
+            label.set_text(_fmt(value, fmt))
+            level = _level(value, limits)
+            chip.classes(replace=f"hdr-stat sv-clickable {level if level in ('warn', 'crit') else ''}")
+
+    live.add(update)
+
+
+def _create_settings_panel(username: str, live: _LiveStats) -> None:
     with ui.column().classes('w-full q-pa-md').style('gap:16px; max-width:700px; margin:0 auto'):
         ui.label('Settings').classes('text-h5 text-weight-bold').style('color:var(--text-1)')
 
@@ -233,6 +375,24 @@ def _create_settings_panel(username: str) -> None:
                         ui.label(key).classes('text-caption').style(
                             'color:var(--text-3); min-width:100px; font-weight:500')
                         ui.label(val).classes('text-body2').style('color:var(--text-2)')
+                metrics = {}
+                for key in ('Temperature', 'CPU', 'RAM', 'Disk'):
+                    with ui.row().classes('items-center').style('gap:12px'):
+                        ui.label(key).classes('text-caption').style(
+                            'color:var(--text-3); min-width:100px; font-weight:500')
+                        metrics[key] = ui.label('…').classes('text-body2').style('color:var(--text-2)')
+
+            def update(stats: SystemStats) -> None:
+                metrics['Temperature'].set_text(_fmt(stats.temperature_c, '{:.1f} °C'))
+                metrics['CPU'].set_text(_fmt(stats.cpu_percent, '{:.0f}%'))
+                metrics['RAM'].set_text(
+                    'n/a' if stats.ram_total_gb is None else
+                    f'{stats.ram_percent:.0f}%  ({stats.ram_used_gb:.1f} / {stats.ram_total_gb:.1f} GB)')
+                metrics['Disk'].set_text(
+                    'n/a' if stats.disk_free_gb is None else
+                    f'{stats.disk_percent:.0f}% used  ({stats.disk_free_gb:.1f} GB free)')
+
+            live.add(update)
 
         # Account
         with ui.card().classes('sv-card w-full q-pa-md'):
@@ -267,6 +427,11 @@ def main_menu() -> None:
     ui.dark_mode().enable()
 
     username = app.storage.user.get('username', 'guest')
+    live = _LiveStats()
+    tab_by_name = {}
+
+    def goto(name: str) -> None:
+        tabs.set_value(tab_by_name[name])
 
     # ── Header ──────────────────────────────────────────────────────────────
     with ui.header().classes('app-header row items-center'):
@@ -274,6 +439,7 @@ def main_menu() -> None:
         ui.label('RPI Surveillance').classes('text-weight-bold q-ml-xs').style(
             'color:var(--text-1); font-size:.98rem; letter-spacing:-.2px')
         ui.space()
+        _create_header_stats(live, goto)
         with ui.row().classes('items-center gt-xs').style('gap:4px; margin-right:4px'):
             ui.icon('person_outline').style('color:var(--text-3); font-size:1rem')
             ui.label(username).classes('text-caption').style('color:var(--text-2)')
@@ -285,17 +451,21 @@ def main_menu() -> None:
         live_tab       = ui.tab('Live',       icon='videocam')
         recordings_tab = ui.tab('Recordings', icon='video_library')
         settings_tab   = ui.tab('Settings',   icon='settings')
+    tab_by_name.update(home=home_tab, live=live_tab, recordings=recordings_tab,
+                       settings=settings_tab)
 
     # ── Tab panels ───────────────────────────────────────────────────────────
     with ui.tab_panels(tabs, value=home_tab).classes('w-full').style('flex:1; overflow-y:auto'):
         with ui.tab_panel(home_tab):
-            _create_home_panel(username)
+            _create_home_panel(username, live, goto)
         with ui.tab_panel(live_tab):
             create_live_view_page()
         with ui.tab_panel(recordings_tab):
             create_record_viewer_page()
         with ui.tab_panel(settings_tab):
-            _create_settings_panel(username)
+            _create_settings_panel(username, live)
+
+    live.start()
 
 
 # ===========================================================================

@@ -29,11 +29,13 @@ except Exception:  # pragma: no cover - only present on a Raspberry Pi
 from rpi_surveillance.backend.camera import (
     DEFAULT_RTSP_URL,
     JPEG_QUALITY,
+    RECORDINGS_DIR,
     RTSPCameraHandler,
     PiCameraHandler,
     Settings,
 )
 from rpi_surveillance.backend.gate_keeper import GateKeeper, GateKeeperConfig
+from rpi_surveillance.backend.system_stats import get_system_stats, stats_dict
 from rpi_surveillance.backend.inference.detector_injector import detector_injector
 from rpi_surveillance.backend.telegram_notifier import TelegramNotifier
 from rpi_surveillance.config import load_env
@@ -402,3 +404,9 @@ def stop_gatekeeper():
 @camera_api.get("/gatekeeper/status")
 def gatekeeper_status():
     return gatekeeper_injector.status()
+
+
+@camera_api.get("/system")
+def system_status():
+    """Raspberry Pi health: SoC temperature, CPU, RAM and recordings disk usage."""
+    return stats_dict(get_system_stats(RECORDINGS_DIR))

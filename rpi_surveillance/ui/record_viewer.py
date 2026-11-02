@@ -1,10 +1,11 @@
 """Record viewer for playback of saved surveillance footage and captured images."""
 
-import os
 from datetime import datetime
 from pathlib import Path
-from nicegui import ui
 
+from nicegui import run, ui
+
+from rpi_surveillance.backend.thumbnails import ensure_thumbnail, remove_thumbnail
 
 RECORDINGS_DIR = Path("/home/brani/recordings")
 MEDIA_URL_PREFIX = "/media"
@@ -37,11 +38,26 @@ class RecordingManager:
     def get_captures(self) -> list[dict]:
         return self._list_files("*.jpg")
 
+    def with_thumbnails(self, files: list[dict]) -> list[dict]:
+        """Attach a cache-busted thumbnail URL (or None) to each file entry."""
+        for f in files:
+            thumb = ensure_thumbnail(Path(f['path']))
+            f['thumb_url'] = None
+            if thumb is not None:
+                rel = thumb.relative_to(self.recordings_dir).as_posix()
+                f['thumb_url'] = f'{MEDIA_URL_PREFIX}/{rel}?v={int(thumb.stat().st_mtime)}'
+        return files
+
+    def list_with_thumbnails(self) -> tuple[list[dict], list[dict]]:
+        return (self.with_thumbnails(self.get_recordings()),
+                self.with_thumbnails(self.get_captures()))
+
     def delete_file(self, file_path: str) -> bool:
         try:
             path = Path(file_path)
             if path.exists() and path.parent == self.recordings_dir:
                 path.unlink()
+                remove_thumbnail(path)
                 return True
         except Exception:
             pass
@@ -218,7 +234,7 @@ def create_record_viewer_page() -> None:
                 if manager.delete_file(rec['path']):
                     ui.notify(f'Deleted {rec["name"]}', color='positive',
                               icon='check_circle', position='top-right')
-                    _refresh()
+                    await _refresh()
                 else:
                     ui.notify('Failed to delete', color='negative', position='top-right')
 
@@ -236,9 +252,16 @@ def create_record_viewer_page() -> None:
             for f in files:
                 with container:
                     with ui.card().classes('rec-item w-full q-pa-sm'):
-                        with ui.row().classes('w-full items-center').style('gap:8px'):
-                            ui.icon(icon).style(
-                                'color:var(--accent); font-size:1.4rem; flex-shrink:0')
+                        with ui.row().classes('w-full items-center no-wrap').style('gap:10px'):
+                            with ui.element('div').classes('rec-thumb').on(
+                                    'click', lambda r=f: on_select(r)):
+                                if f.get('thumb_url'):
+                                    ui.image(f['thumb_url']).props(
+                                        'no-spinner fit=cover loading=lazy').classes('w-full h-full')
+                                else:
+                                    ui.icon(icon).style('color:var(--accent); font-size:1.6rem')
+                                if file_type == 'videos':
+                                    ui.icon('play_circle').classes('rec-thumb-play')
                             with ui.column().style('gap:2px; flex:1; min-width:0'):
                                 ui.label(f['name']).classes(
                                     'text-body2 text-weight-medium').style(
@@ -263,20 +286,19 @@ def create_record_viewer_page() -> None:
                                     on_click=lambda r=f: _delete_file(r)
                                 ).props('flat round dense color=negative').tooltip('Delete')
 
-        def _refresh() -> None:
+        async def _refresh() -> None:
             stats = manager.get_storage_stats()
             storage_label.set_text(
                 f'{stats["videos"]} video(s), {stats["images"]} capture(s)  ·  '
                 f'{stats["gb"]:.3f} GB  ({stats["mb"]:.1f} MB)')
 
-            _render_file_list(video_list_col, manager.get_recordings(),
-                              'movie', _select_video, 'videos')
-            _render_file_list(image_list_col, manager.get_captures(),
-                              'photo', _select_image, 'images')
+            videos, images = await run.io_bound(manager.list_with_thumbnails)
+            _render_file_list(video_list_col, videos, 'movie', _select_video, 'videos')
+            _render_file_list(image_list_col, images, 'photo', _select_image, 'images')
 
         # Wire video buttons
         play_btn.on_click(_play_video)
         stop_vid_btn.on_click(_stop_video)
 
-        # Initial load
-        _refresh()
+        # Initial load (thumbnails are generated off the event loop)
+        ui.timer(0, _refresh, once=True)

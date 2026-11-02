@@ -180,6 +180,27 @@ html, body { background: var(--bg-page) !important; }
     transition    : border-color .15s;
 }
 .rec-item:hover { border-color: var(--accent) !important; }
+.rec-thumb {
+    position        : relative;
+    width           : 112px;
+    height          : 63px;
+    flex-shrink     : 0;
+    border-radius   : 6px;
+    overflow        : hidden;
+    cursor          : pointer;
+    background      : var(--bg-page);
+    border          : 1px solid var(--border);
+    display         : flex;
+    align-items     : center;
+    justify-content : center;
+}
+.rec-thumb-play {
+    position   : absolute;
+    font-size  : 1.6rem;
+    color      : rgba(255,255,255,.85);
+    text-shadow: 0 1px 4px rgba(0,0,0,.6);
+    pointer-events: none;
+}
 
 /* ── Inputs (dark) ──────────────────────────────────────────────────────── */
 .q-field--outlined .q-field__control { border-radius: 8px !important; }

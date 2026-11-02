@@ -1,5 +1,6 @@
 """Record viewer for playback of saved surveillance footage and captured images."""
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -97,8 +98,8 @@ async def _confirm_delete(name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Page component
 # ---------------------------------------------------------------------------
-def create_record_viewer_page() -> None:
-    """Create the recording viewer page component."""
+def create_record_viewer_page() -> Callable[[], Awaitable[None]]:
+    """Create the recording viewer page component and return its refresh coroutine."""
     manager = RecordingManager()
 
     with ui.column().classes('w-full q-pa-md').style('gap:16px; max-width:960px; margin:0 auto'):
@@ -302,3 +303,5 @@ def create_record_viewer_page() -> None:
 
         # Initial load (thumbnails are generated off the event loop)
         ui.timer(0, _refresh, once=True)
+
+    return _refresh

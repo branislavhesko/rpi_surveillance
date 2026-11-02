@@ -482,9 +482,17 @@ def main_menu() -> None:
         with ui.tab_panel(live_tab):
             create_live_view_page()
         with ui.tab_panel(recordings_tab):
-            create_record_viewer_page()
+            refresh_recordings = create_record_viewer_page()
         with ui.tab_panel(settings_tab):
             _create_settings_panel(username, live)
+
+    async def _on_tab_change(e) -> None:
+        name = e.value.props['name'] if isinstance(e.value, ui.tab) else e.value
+        if name == recordings_tab.props['name']:
+            await refresh_recordings()
+
+    # Pick up captures/recordings made since the page was built.
+    tabs.on_value_change(_on_tab_change)
 
     live.start()
 

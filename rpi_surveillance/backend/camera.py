@@ -36,6 +36,22 @@ def _redact_url(url: str) -> str:
     return url
 
 
+def save_capture(frame: np.ndarray, directory: Path | None = None) -> str:
+    """Write ``frame`` as ``capture_<timestamp>.jpg`` and return its path.
+
+    Millisecond timestamps keep quick successive captures from overwriting each
+    other, and a failed write raises instead of being reported as saved.
+    """
+    directory = directory or RECORDINGS_DIR
+    if frame is None or frame.size == 0:
+        raise RuntimeError("No frame to save")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    path = directory / f"capture_{timestamp}.jpg"
+    if not cv2.imwrite(str(path), frame, JPEG_ENCODE_PARAMS) or not path.is_file():
+        raise RuntimeError(f"Could not write {path}")
+    return str(path)
+
+
 def _fit_resolution(frame: np.ndarray, size: tuple[int, int] = TARGET_RESOLUTION) -> np.ndarray:
     """Resize ``frame`` to ``size`` (Full HD by default) if it differs."""
     h, w = frame.shape[:2]
@@ -135,10 +151,7 @@ class PiCameraHandler:
 
     def save_image(self) -> str:
         """Capture and save a single frame as JPEG."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = str(RECORDINGS_DIR / f"capture_{timestamp}.jpg")
-        frame = self.capture_image()
-        cv2.imwrite(filename, frame, JPEG_ENCODE_PARAMS)
+        filename = save_capture(self.capture_image())
         self.logger.info(f"Saved image to {filename}")
         return filename
 
@@ -358,10 +371,7 @@ class RTSPCameraHandler:
 
     def save_image(self) -> str:
         """Capture and save a single frame as JPEG."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = str(RECORDINGS_DIR / f"capture_{timestamp}.jpg")
-        frame = self.capture_image()
-        cv2.imwrite(filename, frame, JPEG_ENCODE_PARAMS)
+        filename = save_capture(self.capture_image())
         self.logger.info(f"Saved image to {filename}")
         return filename
 
